@@ -251,14 +251,29 @@ class WebhookController extends Controller
         }
     }
 
-    /* =========================
-     *  WEBHOOK (Givecloud)
-     * ========================= */
+    private function verifyGivecloud(Request $r): void
+    {
+        $secret = env('GC_WEBHOOK_SECRET');
+        abort_unless($secret, 500, 'Missing GC_WEBHOOK_SECRET');
+        $sig = $r->header('X-Givecloud-Signature') ?? $r->header('x-givecloud-signature');
+        if ($sig) {
+            $raw = $r->getContent(); // raw JSON body
+            $calc = hash_hmac('sha1', $raw, $secret);
+            if (!hash_equals($sig, $calc)) {
+                abort(401, 'Invalid signature');
+            }
+            return;
+        }
+
+        if ($r->header('x-gc-secret') !== $secret) {
+            abort(401, 'Unauthorized');
+        }
+    }
+
 
     public function gc(Request $r)
     {
-        // Secret must match Givecloud webhook header
-        abort_unless($r->header('x-gc-secret') === env('GC_WEBHOOK_SECRET'), 401, 'Unauthorized');
+       $this->verifyGivecloud($r);
 
         $b = $r->json()->all();
 
