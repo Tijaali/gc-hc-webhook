@@ -262,160 +262,188 @@ class WebhookController extends Controller
     /* =========================
      *  Main webhook (all events)
      * ========================= */
-    public function gc(Request $r)
-    {
-        $this->verifyGivecloud($r);
-        $event = (string) ($r->header('X-Givecloud-Event') ?? '');
+   // In WebhookController.php
 
-        try {
-            $b = $r->json()->all();
+public function gc(Request $r)
+{
+    $this->verifyGivecloud($r);
+    $event = (string) ($r->header('X-Givecloud-Event') ?? '');
+    $body  = $r->json()->all();
 
-            // ---------- Email (supporters[] OR top-level/supporter) ----------
-            $emails = array_filter(Arr::flatten([
-                data_get($b, 'email'),
-                data_get($b, 'supporter.email'),
-                data_get($b, 'billing_address.email'),
-                data_get($b, 'account.email'),
-                data_get($b, 'customer.email'),
-                data_get($b, 'supporters.*.email'),
-                data_get($b, 'supporters.*.billing_address.email'),
-            ]));
-            $email = $emails ? reset($emails) : null;
-
-            if (!$email) {
-                Log::info('GC webhook: skipped (no email)', ['event' => $event, 'body' => $b]);
-                return response()->json(['status' => 'skipped', 'reason' => 'no email'], 200);
+    try {
+        switch ($event) {
+            case 'supporter_created':
+            case 'supporter_updated': {
+                $arr = data_get($body, 'supporters', []);
+                $processed = 0;
+                foreach ((array) $arr as $sup) {
+                    // Build a minimal, contribution-like shape for the per-supporter upsert
+                    $mini = [
+                        'supporter'       => $sup,
+                        'email'           => data_get($sup, 'email') ?? data_get($sup, 'billing_address.email'),
+                        'billing_address' => data_get($sup, 'billing_address'),
+                        // no amounts/dates in these events, that’s fine
+                    ];
+                    $processed += $this->processOne($mini, null);
+                }
+                return response()->json(['ok' => true, 'event' => $event, 'processed' => $processed], 200);
             }
 
-            // ---------- Names ----------
-            $firsts = array_filter(Arr::flatten([
-                data_get($b, 'supporter.first_name'),
-                data_get($b, 'billing_address.first_name'),
-                data_get($b, 'supporters.*.first_name'),
-                data_get($b, 'supporters.*.billing_address.first_name'),
-            ]));
-            $lasts = array_filter(Arr::flatten([
-                data_get($b, 'supporter.last_name'),
-                data_get($b, 'billing_address.last_name'),
-                data_get($b, 'supporters.*.last_name'),
-                data_get($b, 'supporters.*.billing_address.last_name'),
-            ]));
-            $first = $firsts ? reset($firsts) : null;
-            $last  = $lasts  ? reset($lasts)  : null;
-
-            // ---------- Phone (numeric HS prop) ----------
-            $phones = array_filter(Arr::flatten([
-                data_get($b, 'billing_address.phone'),
-                data_get($b, 'supporters.*.billing_address.phone'),
-                data_get($b, 'supporter.billing_address.phone'),
-            ]));
-            $phoneDigits = null;
-            if ($phones) {
-                $digits = preg_replace('/\D+/', '', (string) reset($phones));
-                $phoneDigits = $digits !== '' ? (int) $digits : null;
+            case 'contribution_paid':
+            case 'contributions_paid': {
+                // Normal paid contribution
+                $this->processOne($body, 'paid');
+                return response()->json(['ok' => true, 'event' => $event], 200);
             }
 
-            // ---------- Location ----------
-            $countries = array_filter(Arr::flatten([
-                data_get($b, 'billing_address.country_code'),
-                data_get($b, 'billing_address.country'),
-                data_get($b, 'supporters.*.billing_address.country_code'),
-                data_get($b, 'supporters.*.billing_address.country'),
-                data_get($b, 'supporter.billing_address.country'),
-            ]));
-            $provinces = array_filter(Arr::flatten([
-                data_get($b, 'billing_address.province_code'),
-                data_get($b, 'billing_address.state'),
-                data_get($b, 'supporters.*.billing_address.province_code'),
-                data_get($b, 'supporters.*.billing_address.state'),
-                data_get($b, 'supporter.billing_address.state'),
-            ]));
-            $country  = $countries ? reset($countries) : null;
-            $province = $provinces ? reset($provinces) : null;
-
-            // ---------- Donor ID (numeric for HS number field) ----------
-            $donorId = data_get($b, 'supporter.id_deprecated')
-                    ?? data_get($b, 'supporter.id')
-                    ?? data_get($b, 'account.id')
-                    ?? data_get($b, 'supporters.0.id');
-            $donorId = is_numeric($donorId) ? (int) $donorId : null;
-
-            // ---------- Amount / Currency / Dates ----------
-            $amount   = data_get($b, 'total_amount') ?? data_get($b, 'amount') ?? data_get($b, 'subtotal_amount');
-            $currency = data_get($b, 'currency') ?? data_get($b, 'payments.0.currency.code');
-            $lastDonationAmount = ($amount !== null && $currency) ? (string) ($amount . ' ' . $currency) : null;
-
-            $rawDate  = data_get($b, 'ordered_at') ?? data_get($b, 'created_at');
-            $lastDate = null;
-            if ($rawDate) {
-                try { $lastDate = Carbon::parse($rawDate)->toDateString(); }
-                catch (\Throwable $e) { $lastDate = substr((string) $rawDate, 0, 10); }
+            case 'contribution_refunded': {
+                // Mark status as refunded; still upsert donor + fields we can extract
+                $this->processOne($body, 'refunded');
+                return response()->json(['ok' => true, 'event' => $event], 200);
             }
 
-            // ---------- Recurring summary ----------
-            $recAmt = data_get($b, 'line_items.0.recurring_amount')
-                   ?? data_get($b, 'line_items.0.recurring.amount')
-                   ?? data_get($b, 'line_items.0.total');
-            $freq   = data_get($b, 'line_items.0.recurring.frequency')
-                   ?? data_get($b, 'line_items.0.recurring_profile.billing_period_description');
-            $day    = data_get($b, 'line_items.0.recurring.day')
-                   ?? data_get($b, 'line_items.0.recurring_profile.billing_period_day')
-                   ?? data_get($b, 'line_items.0.recurring_day');
-            $recurringSummary = ($recAmt && $freq)
-                ? ('$' . $recAmt . ' / ' . $freq . ($day ? ' / ' . $day : ''))
-                : null;
+            case 'recurring_profile_updated': {
+                // Payload focuses on the recurring profile; helper knows how to read it
+                $this->processOne($body, null);
+                return response()->json(['ok' => true, 'event' => $event], 200);
+            }
 
-            // ---------- Transaction / payment info ----------
-            $pmBrand   = data_get($b, 'payments.0.card.brand');
-            $pmType    = data_get($b, 'payments.0.type') ?? data_get($b, 'payment_type');
-            $wallet    = data_get($b, 'payments.0.card.wallet');
-            $pmDesc    = trim(implode(' ', array_filter([$pmType, $pmBrand, $wallet])));
-            $pmStatus  = data_get($b, 'payments.0.status') ?? data_get($b, 'payments.0.outcome') ?? null;
-            $pmFailure = data_get($b, 'payments.0.failure_message') ?? null;
-
-            // ---------- Lifetime total ----------
-            $lifetime = data_get($b, 'supporter.lifetime_donation_amount');
-
-            // ---------- Donor profile URL ----------
-            $profileUrl = data_get($b, 'supporter.profile_url')
-                       ?? data_get($b, 'line_items.0.public_url')
-                       ?? data_get($b, 'line_items.0.sponsorship.url');
-
-            // ---------- Upsert in Help Scout ----------
-            $token    = $this->hsAccessToken();
-            $customer = $this->hsFindCustomer($token, $email);
-            $id       = $customer['id'] ?? 0;
-            if (!$id) $id = $this->hsCreateCustomer($token, $first, $last, $email);
-
-            // ---------- Patch HS custom properties ----------
-            $this->hsPatchProperties($token, $id, [
-                'donor_id'             => $donorId,
-                'country'              => $country,
-                'province'             => $province,
-                'phone'                => $phoneDigits,
-                'last_donation_date'   => $lastDate,
-                'last_donation_amount' => $lastDonationAmount,    // requires text prop 'last-donation-amount'
-                'recurring_summary'    => $recurringSummary,      // requires text prop 'recurring-summary'
-                'payment_method'       => $pmDesc,                 // requires text prop 'payment-method'
-                'payment_status'       => $pmStatus,
-                'payment_failure'      => $pmFailure,
-                'lifetime_donation'    => is_numeric($lifetime) ? (float) $lifetime : null,
-                'donor_profile_url'    => $profileUrl,
-            ]);
-
-            return response()->json(['ok' => true, 'event' => $event, 'customerId' => $id], 200);
-
-        } catch (\Throwable $e) {
-            Log::error('GC handler error', [
-                'event' => $event,
-                'msg'   => $e->getMessage(),
-                'file'  => $e->getFile(),
-                'line'  => $e->getLine(),
-            ]);
-            // ACK to Givecloud so the dashboard doesn’t show failures
-            return response()->json(['status' => 'ok'], 200);
+            default: {
+                // Future/unknown events — try our best with generic extractor
+                $this->processOne($body, null);
+                return response()->json(['ok' => true, 'event' => $event, 'note' => 'generic'], 200);
+            }
         }
+
+    } catch (\Throwable $e) {
+        Log::error('GC handler error', [
+            'event' => $event,
+            'msg'   => $e->getMessage(),
+            'file'  => $e->getFile(),
+            'line'  => $e->getLine(),
+        ]);
+        // Always ACK Givecloud so the dashboard stays green
+        return response()->json(['status' => 'ok'], 200);
     }
+}
+
+/**
+ * Normalize ANY Givecloud payload into the donor fields you want,
+ * then upsert into Help Scout (create + JSON Patch custom properties).
+ *
+ * @return int 1 if processed, 0 if skipped
+ */
+private function processOne(array $b, ?string $forcedPaymentStatus = null): int
+{
+    // -------- Email (required) --------
+    $email = data_get($b, 'email')
+        ?? data_get($b, 'supporter.email')
+        ?? data_get($b, 'billing_address.email')
+        ?? data_get($b, 'account.email')
+        ?? data_get($b, 'customer.email');
+
+    if (!$email) {
+        Log::info('GC webhook: skipped (no email)', ['body' => $b]);
+        return 0;
+    }
+
+    // -------- Names --------
+    $first = data_get($b, 'supporter.first_name') ?? data_get($b, 'billing_address.first_name');
+    $last  = data_get($b, 'supporter.last_name')  ?? data_get($b, 'billing_address.last_name');
+
+    // -------- Phone (numeric HS prop) --------
+    $rawPhone = data_get($b, 'billing_address.phone')
+        ?? data_get($b, 'supporter.billing_address.phone');
+    $phoneDigits = null;
+    if ($rawPhone) {
+        $digits = preg_replace('/\D+/', '', (string) $rawPhone);
+        if ($digits !== '') $phoneDigits = (int) $digits;
+    }
+
+    // -------- Location --------
+    $country  = data_get($b, 'billing_address.country_code')
+        ?? data_get($b, 'billing_address.country')
+        ?? data_get($b, 'supporter.billing_address.country');
+    $province = data_get($b, 'billing_address.province_code')
+        ?? data_get($b, 'billing_address.state')
+        ?? data_get($b, 'supporter.billing_address.state');
+
+    // -------- Donor ID (numeric) --------
+    $donorId = data_get($b, 'supporter.id_deprecated')
+        ?? data_get($b, 'supporter.id')
+        ?? data_get($b, 'account.id');
+    $donorId = is_numeric($donorId) ? (int) $donorId : null;
+
+    // -------- Amount / Currency / Last donation date --------
+    $amount   = data_get($b, 'total_amount') ?? data_get($b, 'amount') ?? data_get($b, 'subtotal_amount');
+    $currency = data_get($b, 'currency') ?? data_get($b, 'payments.0.currency.code');
+    $lastDonationAmount = ($amount !== null && $currency) ? (string) ($amount . ' ' . $currency) : null;
+
+    $rawDate  = data_get($b, 'ordered_at') ?? data_get($b, 'created_at');
+    $lastDate = null;
+    if ($rawDate) {
+        try { $lastDate = \Carbon\Carbon::parse($rawDate)->toDateString(); }
+        catch (\Throwable $e) { $lastDate = substr((string) $rawDate, 0, 10); }
+    }
+
+    // -------- Recurring summary (from line_items OR top-level recurring_profile) --------
+    $recAmt = data_get($b, 'line_items.0.recurring_amount')
+           ?? data_get($b, 'line_items.0.recurring.amount')
+           ?? data_get($b, 'line_items.0.total')
+           ?? data_get($b, 'recurring_profile.amount')
+           ?? data_get($b, 'recurring_profile.aggregate_amount');
+    $freq = data_get($b, 'line_items.0.recurring.frequency')
+         ?? data_get($b, 'line_items.0.recurring_profile.billing_period_description')
+         ?? data_get($b, 'recurring_profile.billing_period_description')
+         ?? data_get($b, 'recurring_profile.billing_period');
+    $day  = data_get($b, 'line_items.0.recurring.day')
+         ?? data_get($b, 'line_items.0.recurring_profile.billing_period_day')
+         ?? data_get($b, 'recurring_profile.billing_period_day');
+    $recurringSummary = ($recAmt && $freq)
+        ? ('$' . $recAmt . ' / ' . $freq . ($day ? ' / ' . $day : ''))
+        : null;
+
+    // -------- Payment info / status --------
+    $pmBrand   = data_get($b, 'payments.0.card.brand');
+    $pmType    = data_get($b, 'payments.0.type') ?? data_get($b, 'payment_type');
+    $wallet    = data_get($b, 'payments.0.card.wallet');
+    $pmDesc    = trim(implode(' ', array_filter([$pmType, $pmBrand, $wallet])));
+    $pmStatus  = $forcedPaymentStatus ?? (data_get($b, 'payments.0.status') ?? data_get($b, 'payments.0.outcome'));
+    $pmFailure = data_get($b, 'payments.0.failure_message') ?? null;
+
+    // -------- Lifetime total --------
+    $lifetime = data_get($b, 'supporter.lifetime_donation_amount');
+
+    // -------- Donor profile URL --------
+    $profileUrl = data_get($b, 'supporter.profile_url')
+               ?? data_get($b, 'line_items.0.public_url')
+               ?? data_get($b, 'line_items.0.sponsorship.url');
+
+    // -------- Upsert in Help Scout --------
+    $token    = $this->hsAccessToken();
+    $customer = $this->hsFindCustomer($token, $email);
+    $id       = $customer['id'] ?? 0;
+    if (!$id) $id = $this->hsCreateCustomer($token, $first, $last, $email);
+
+    // -------- Patch HS custom properties --------
+    $this->hsPatchProperties($token, $id, [
+        'donor_id'             => $donorId,
+        'country'              => $country,
+        'province'             => $province,
+        'phone'                => $phoneDigits,
+        'last_donation_date'   => $lastDate,
+        'last_donation_amount' => $lastDonationAmount,  // needs HS text prop 'last-donation-amount'
+        'recurring_summary'    => $recurringSummary,    // needs HS text prop 'recurring-summary'
+        'payment_method'       => $pmDesc,              // needs HS text prop 'payment-method'
+        'payment_status'       => $pmStatus,
+        'payment_failure'      => $pmFailure,
+        'lifetime_donation'    => is_numeric($lifetime) ? (float) $lifetime : null,
+        'donor_profile_url'    => $profileUrl,
+    ]);
+
+    return 1;
+}
+
 
     /* =========================
      *  Debug endpoints
