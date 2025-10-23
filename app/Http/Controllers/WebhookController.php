@@ -16,14 +16,12 @@ class WebhookController extends Controller
     private string $hsApi      = 'https://api.helpscout.net/v2';
 
     /* =========================
-     *    OAUTH (Help Scout)
+     *  Help Scout OAuth
      * ========================= */
-
     public function hsStart()
     {
         $clientId    = env('HS_CLIENT_ID');
         $redirectUri = env('HS_REDIRECT_URI');
-
         abort_unless($clientId && $redirectUri, 500, 'Missing HS_CLIENT_ID or HS_REDIRECT_URI');
 
         $authUrl = 'https://secure.helpscout.net/authentication/authorizeClientApplication'
@@ -50,13 +48,12 @@ class WebhookController extends Controller
         }
 
         $data = $resp->json();
-
         if (!empty($data['refresh_token'])) {
             $this->saveHsRefreshToken($data['refresh_token']);
         }
 
         return response()->json([
-            'access_token_first8' => substr((string)($data['access_token'] ?? ''), 0, 8),
+            'access_token_first8' => substr((string) ($data['access_token'] ?? ''), 0, 8),
             'refresh_token_saved' => !empty($data['refresh_token']),
             'token_type'          => $data['token_type'] ?? null,
             'expires_in'          => $data['expires_in'] ?? null,
@@ -68,9 +65,7 @@ class WebhookController extends Controller
         $path = 'hs_oauth.json';
         if (Storage::exists($path)) {
             $saved = json_decode(Storage::get($path), true);
-            if (!empty($saved['refresh_token'])) {
-                return (string) $saved['refresh_token'];
-            }
+            if (!empty($saved['refresh_token'])) return (string) $saved['refresh_token'];
         }
         $env = env('HS_REFRESH_TOKEN');
         return $env ? (string) $env : null;
@@ -102,22 +97,18 @@ class WebhookController extends Controller
             }
 
             $data = $resp->json();
-
             if (!empty($data['refresh_token'])) {
                 $this->saveHsRefreshToken($data['refresh_token']);
             }
-
             return (string) $data['access_token'];
         });
     }
 
     /* =========================
-     *  HELP SCOUT: Customers
+     *  Help Scout: Customers
      * ========================= */
-
     private function hsFindCustomer(string $token, string $email): ?array
     {
-        // A) DSL query
         $r = Http::withToken($token)->get("{$this->hsApi}/customers", [
             'query' => '(email:"' . $email . '")',
             'page'  => 1,
@@ -129,7 +120,6 @@ class WebhookController extends Controller
             Log::warning('HS search A failed', ['status' => $r->status(), 'body' => $r->body()]);
         }
 
-        // B) direct email param
         $r2 = Http::withToken($token)->get("{$this->hsApi}/customers", [
             'email' => $email,
             'page'  => 1,
@@ -141,7 +131,7 @@ class WebhookController extends Controller
             Log::warning('HS search B failed', ['status' => $r2->status(), 'body' => $r2->body()]);
         }
 
-        // C) search API (not on all plans)
+        // Some accounts don’t have this endpoint; 404 is fine.
         $r3 = Http::withToken($token)->get("{$this->hsApi}/search/customers", [
             'query' => 'email:"' . $email . '"',
             'page'  => 1,
@@ -170,9 +160,7 @@ class WebhookController extends Controller
         if ($r->status() === 409) {
             Log::info('HS create returned 409; fetching existing', ['email' => $email]);
             $existing = $this->hsFindCustomer($token, $email);
-            if ($existing && isset($existing['id'])) {
-                return (int) $existing['id'];
-            }
+            if ($existing && isset($existing['id'])) return (int) $existing['id'];
         }
 
         if ($r->successful()) {
@@ -194,33 +182,30 @@ class WebhookController extends Controller
         });
     }
 
-    /**
-     * Update HS customer properties using an array of {slug,value} objects.
-     * (Safer than JSON-Patch "ops" for your account, based on previous errors.)
-     */
     private function hsPatchProperties(string $token, int $customerId, array $kv): void
     {
+        // Your existing slugs + optional ones (create in HS if you want them shown)
         $slugMap = [
-            'donor_id'            => 'donor-id',           // number
-            'last_donation_date'  => 'last-order',         // date YYYY-MM-DD
-            'country'             => 'country',            // text
-            'province'            => 'state',              // text
-            'lifetime_donation'   => 'lifetime-donation',  // number
-            'donor_profile_url'   => 'gc-donor-profile',   // url/text
-            'phone'               => 'phone-no',           // number
-            'preferred_language'  => 'preferred-language', // dropdown (option id)
-            // If you add new HS properties, map them here:
-            'last_donation_amount' => 'last-donation-amount',
-            'payment_method'       => 'payment-method',
+            'donor_id'             => 'donor-id',            // number
+            'country'              => 'country',             // text
+            'province'             => 'state',               // text
+            'last_donation_date'   => 'last-order',          // date YYYY-MM-DD
+            'last_donation_amount' => 'last-donation-amount',// text (optional — create in HS)
+            'recurring_summary'    => 'recurring-summary',   // text (optional — create in HS)
+            'payment_method'       => 'payment-method',      // text (optional — create in HS)
+            'payment_status'       => 'payment-status',      // text
+            'payment_failure'      => 'payment-failure',     // text
+            'lifetime_donation'    => 'lifetime-donation',   // number
+            'donor_profile_url'    => 'gc-donor-profile',    // url/text
+            'phone'                => 'phone-no',            // number
         ];
 
         $numericSlugs = ['donor-id', 'lifetime-donation', 'phone-no'];
         $existing     = $this->hsPropertySlugs($token);
 
-        $payload = [];
+        $ops = [];
         foreach ($kv as $concept => $val) {
             if ($val === null || $val === '') continue;
-
             $slug = $slugMap[$concept] ?? null;
             if (!$slug) continue;
             if (!in_array($slug, $existing, true)) continue;
@@ -231,36 +216,29 @@ class WebhookController extends Controller
             }
 
             if ($slug === 'last-order') {
-                try {
-                    $val = Carbon::parse($val)->toDateString();
-                } catch (\Throwable $e) {
-                    $val = substr((string) $val, 0, 10);
-                }
+                try { $val = Carbon::parse($val)->toDateString(); }
+                catch (\Throwable $e) { $val = substr((string)$val, 0, 10); }
             }
 
-            $payload[] = ['slug' => $slug, 'value' => $val];
+            $ops[] = ['op' => 'replace', 'path' => '/' . $slug, 'value' => $val];
         }
 
-        if (!$payload) return;
+        if (!$ops) return;
 
+        // JSON Patch
         $r = Http::withToken($token)
-            ->acceptJson()->asJson()
-            ->patch("{$this->hsApi}/customers/{$customerId}/properties", $payload);
+            ->withBody(json_encode($ops), 'application/json-patch+json')
+            ->send('PATCH', "{$this->hsApi}/customers/{$customerId}/properties");
 
         if (!in_array($r->status(), [200, 204], true)) {
-            Log::error('HS properties failed', [
-                'status'  => $r->status(),
-                'body'    => $r->body(),
-                'payload' => $payload,
-            ]);
-            abort(500, 'HS properties failed: ' . $r->body());
+            Log::error('HS properties failed', ['status' => $r->status(), 'body' => $r->body(), 'ops' => $ops]);
+            // Don’t throw to Givecloud; let caller ack 200
         }
     }
 
     /* =========================
-     *   Givecloud validation
+     *  Givecloud signature verify
      * ========================= */
-
     private function verifyGivecloud(Request $r): void
     {
         $secret = (string) env('GC_WEBHOOK_SECRET', '');
@@ -268,15 +246,13 @@ class WebhookController extends Controller
 
         $sig = $r->header('X-Givecloud-Signature') ?? $r->header('x-givecloud-signature');
         $raw = $r->getContent();
-
-        // Givecloud sends an HMAC-SHA1 of the raw body using your secret.
         $calc = hash_hmac('sha1', $raw, $secret);
 
         if (env('GC_LOG_SIG', false)) {
-            Log::debug('GC sig debug', [
-                'received'   => (string) $sig,
-                'calculated' => (string) $calc,
-                'match'      => $sig && hash_equals((string)$sig, (string)$calc),
+            Log::debug('GC sig', [
+                'received' => (string) $sig,
+                'calc'     => (string) $calc,
+                'match'    => $sig && hash_equals((string)$sig, (string)$calc),
             ]);
         }
 
@@ -284,155 +260,166 @@ class WebhookController extends Controller
     }
 
     /* =========================
-     *       Webhook (GC)
+     *  Main webhook (all events)
      * ========================= */
-
     public function gc(Request $r)
     {
         $this->verifyGivecloud($r);
+        $event = (string) ($r->header('X-Givecloud-Event') ?? '');
 
-        $b = $r->json()->all();
+        try {
+            $b = $r->json()->all();
 
-        // ---- EMAIL (supporters array aware) ----
-        $emails = array_filter(Arr::flatten([
-            data_get($b, 'email'),
-            data_get($b, 'supporter.email'),
-            data_get($b, 'supporters.*.email'),
-            data_get($b, 'billing_address.email'),
-            data_get($b, 'supporters.*.billing_address.email'),
-            data_get($b, 'account.email'),
-            data_get($b, 'customer.email'),
-        ]));
-        $email = $emails ? reset($emails) : null;
+            // ---------- Email (supporters[] OR top-level/supporter) ----------
+            $emails = array_filter(Arr::flatten([
+                data_get($b, 'email'),
+                data_get($b, 'supporter.email'),
+                data_get($b, 'billing_address.email'),
+                data_get($b, 'account.email'),
+                data_get($b, 'customer.email'),
+                data_get($b, 'supporters.*.email'),
+                data_get($b, 'supporters.*.billing_address.email'),
+            ]));
+            $email = $emails ? reset($emails) : null;
 
-        if (!$email) {
-            Log::info('GC webhook: skipped (no email)', ['body' => $b]);
-            return response()->json(['status' => 'skipped', 'reason' => 'no email'], 202);
-        }
-
-        // ---- NAMES ----
-        $first = data_get($b, 'supporter.first_name')
-            ?? data_get($b, 'supporters.0.first_name')
-            ?? data_get($b, 'billing_address.first_name')
-            ?? data_get($b, 'supporters.0.billing_address.first_name');
-
-        $last  = data_get($b, 'supporter.last_name')
-            ?? data_get($b, 'supporters.0.last_name')
-            ?? data_get($b, 'billing_address.last_name')
-            ?? data_get($b, 'supporters.0.billing_address.last_name');
-
-        // ---- AMOUNT / CURRENCY (for optional props) ----
-        $amount   = data_get($b, 'total_amount') ?? data_get($b, 'amount');
-        $currency = data_get($b, 'currency') ?? data_get($b, 'payments.0.currency.code');
-        $lastAmt  = ($amount !== null && $currency) ? "{$amount} {$currency}" : null;
-
-        // ---- DATE (order/created/supporter updated) ----
-        $rawDate  = data_get($b, 'ordered_at')
-            ?? data_get($b, 'created_at')
-            ?? data_get($b, 'supporters.0.updated_at')
-            ?? data_get($b, 'supporters.0.created_at');
-
-        $lastDate = null;
-        if ($rawDate) {
-            try {
-                $lastDate = Carbon::parse($rawDate)->toDateString();
-            } catch (\Throwable $e) {
-                $lastDate = substr((string) $rawDate, 0, 10);
+            if (!$email) {
+                Log::info('GC webhook: skipped (no email)', ['event' => $event, 'body' => $b]);
+                return response()->json(['status' => 'skipped', 'reason' => 'no email'], 200);
             }
-        }
 
-        // ---- PAYMENT METHOD (optional) ----
-        $pm = data_get($b, 'payments.0.card.brand')
-            ?? data_get($b, 'payments.0.type')
-            ?? data_get($b, 'payment_type');
+            // ---------- Names ----------
+            $firsts = array_filter(Arr::flatten([
+                data_get($b, 'supporter.first_name'),
+                data_get($b, 'billing_address.first_name'),
+                data_get($b, 'supporters.*.first_name'),
+                data_get($b, 'supporters.*.billing_address.first_name'),
+            ]));
+            $lasts = array_filter(Arr::flatten([
+                data_get($b, 'supporter.last_name'),
+                data_get($b, 'billing_address.last_name'),
+                data_get($b, 'supporters.*.last_name'),
+                data_get($b, 'supporters.*.billing_address.last_name'),
+            ]));
+            $first = $firsts ? reset($firsts) : null;
+            $last  = $lasts  ? reset($lasts)  : null;
 
-        // ---- GEO ----
-        $country  = data_get($b, 'billing_address.country_code')
-            ?? data_get($b, 'billing_address.country')
-            ?? data_get($b, 'supporters.0.billing_address.country');
+            // ---------- Phone (numeric HS prop) ----------
+            $phones = array_filter(Arr::flatten([
+                data_get($b, 'billing_address.phone'),
+                data_get($b, 'supporters.*.billing_address.phone'),
+                data_get($b, 'supporter.billing_address.phone'),
+            ]));
+            $phoneDigits = null;
+            if ($phones) {
+                $digits = preg_replace('/\D+/', '', (string) reset($phones));
+                $phoneDigits = $digits !== '' ? (int) $digits : null;
+            }
 
-        $province = data_get($b, 'billing_address.province_code')
-            ?? data_get($b, 'billing_address.state')
-            ?? data_get($b, 'supporters.0.billing_address.state');
+            // ---------- Location ----------
+            $countries = array_filter(Arr::flatten([
+                data_get($b, 'billing_address.country_code'),
+                data_get($b, 'billing_address.country'),
+                data_get($b, 'supporters.*.billing_address.country_code'),
+                data_get($b, 'supporters.*.billing_address.country'),
+                data_get($b, 'supporter.billing_address.country'),
+            ]));
+            $provinces = array_filter(Arr::flatten([
+                data_get($b, 'billing_address.province_code'),
+                data_get($b, 'billing_address.state'),
+                data_get($b, 'supporters.*.billing_address.province_code'),
+                data_get($b, 'supporters.*.billing_address.state'),
+                data_get($b, 'supporter.billing_address.state'),
+            ]));
+            $country  = $countries ? reset($countries) : null;
+            $province = $provinces ? reset($provinces) : null;
 
-        // ---- LIFETIME & DONOR ID ----
-        $lifetime = data_get($b, 'supporter.lifetime_donation_amount')
-            ?? data_get($b, 'supporters.0.lifetime_donation_amount');
+            // ---------- Donor ID (numeric for HS number field) ----------
+            $donorId = data_get($b, 'supporter.id_deprecated')
+                    ?? data_get($b, 'supporter.id')
+                    ?? data_get($b, 'account.id')
+                    ?? data_get($b, 'supporters.0.id');
+            $donorId = is_numeric($donorId) ? (int) $donorId : null;
 
-        $donorId  = data_get($b, 'supporter.id')
-            ?? data_get($b, 'supporters.0.id')
-            ?? data_get($b, 'account.id');
+            // ---------- Amount / Currency / Dates ----------
+            $amount   = data_get($b, 'total_amount') ?? data_get($b, 'amount') ?? data_get($b, 'subtotal_amount');
+            $currency = data_get($b, 'currency') ?? data_get($b, 'payments.0.currency.code');
+            $lastDonationAmount = ($amount !== null && $currency) ? (string) ($amount . ' ' . $currency) : null;
 
-        // ---- PHONE ----
-        $rawPhone = data_get($b, 'billing_address.phone')
-            ?? data_get($b, 'supporters.0.billing_address.phone')
-            ?? data_get($b, 'supporter.phone')
-            ?? data_get($b, 'account.phone')
-            ?? data_get($b, 'customer.phone');
+            $rawDate  = data_get($b, 'ordered_at') ?? data_get($b, 'created_at');
+            $lastDate = null;
+            if ($rawDate) {
+                try { $lastDate = Carbon::parse($rawDate)->toDateString(); }
+                catch (\Throwable $e) { $lastDate = substr((string) $rawDate, 0, 10); }
+            }
 
-        $phone = $this->normalizePhone($rawPhone);
+            // ---------- Recurring summary ----------
+            $recAmt = data_get($b, 'line_items.0.recurring_amount')
+                   ?? data_get($b, 'line_items.0.recurring.amount')
+                   ?? data_get($b, 'line_items.0.total');
+            $freq   = data_get($b, 'line_items.0.recurring.frequency')
+                   ?? data_get($b, 'line_items.0.recurring_profile.billing_period_description');
+            $day    = data_get($b, 'line_items.0.recurring.day')
+                   ?? data_get($b, 'line_items.0.recurring_profile.billing_period_day')
+                   ?? data_get($b, 'line_items.0.recurring_day');
+            $recurringSummary = ($recAmt && $freq)
+                ? ('$' . $recAmt . ' / ' . $freq . ($day ? ' / ' . $day : ''))
+                : null;
 
-        // ---- Preferred Language -> HS dropdown option id (optional) ----
-        $preferredLang = $this->mapLanguage(
-            data_get($b, 'supporter.preferred_language')
-            ?? data_get($b, 'supporters.0.preferred_language')
-        );
+            // ---------- Transaction / payment info ----------
+            $pmBrand   = data_get($b, 'payments.0.card.brand');
+            $pmType    = data_get($b, 'payments.0.type') ?? data_get($b, 'payment_type');
+            $wallet    = data_get($b, 'payments.0.card.wallet');
+            $pmDesc    = trim(implode(' ', array_filter([$pmType, $pmBrand, $wallet])));
+            $pmStatus  = data_get($b, 'payments.0.status') ?? data_get($b, 'payments.0.outcome') ?? null;
+            $pmFailure = data_get($b, 'payments.0.failure_message') ?? null;
 
-        // ---- Upsert in Help Scout ----
-        $token    = $this->hsAccessToken();
-        $customer = $this->hsFindCustomer($token, $email);
-        $id       = (int) ($customer['id'] ?? 0);
-        if (!$id) $id = $this->hsCreateCustomer($token, $first, $last, $email);
+            // ---------- Lifetime total ----------
+            $lifetime = data_get($b, 'supporter.lifetime_donation_amount');
 
-        if ($id > 0) {
+            // ---------- Donor profile URL ----------
+            $profileUrl = data_get($b, 'supporter.profile_url')
+                       ?? data_get($b, 'line_items.0.public_url')
+                       ?? data_get($b, 'line_items.0.sponsorship.url');
+
+            // ---------- Upsert in Help Scout ----------
+            $token    = $this->hsAccessToken();
+            $customer = $this->hsFindCustomer($token, $email);
+            $id       = $customer['id'] ?? 0;
+            if (!$id) $id = $this->hsCreateCustomer($token, $first, $last, $email);
+
+            // ---------- Patch HS custom properties ----------
             $this->hsPatchProperties($token, $id, [
-                'donor_id'             => is_numeric($donorId) ? (int) $donorId : null,
-                'last_donation_date'   => $lastDate,
+                'donor_id'             => $donorId,
                 'country'              => $country,
                 'province'             => $province,
+                'phone'                => $phoneDigits,
+                'last_donation_date'   => $lastDate,
+                'last_donation_amount' => $lastDonationAmount,    // requires text prop 'last-donation-amount'
+                'recurring_summary'    => $recurringSummary,      // requires text prop 'recurring-summary'
+                'payment_method'       => $pmDesc,                 // requires text prop 'payment-method'
+                'payment_status'       => $pmStatus,
+                'payment_failure'      => $pmFailure,
                 'lifetime_donation'    => is_numeric($lifetime) ? (float) $lifetime : null,
-                'donor_profile_url'    => data_get($b, 'supporter.profile_url')
-                    ?? data_get($b, 'supporters.0.profile_url')
-                    ?? null,
-                'phone'                => $phone,
-                'preferred_language'   => $preferredLang,
-                // The next two only work if you create matching HS properties and map in $slugMap:
-                'payment_method'       => $pm ?: null,
-                'last_donation_amount' => $lastAmt,
+                'donor_profile_url'    => $profileUrl,
             ]);
-        } else {
-            Log::warning('HS upsert skipped (no id resolvable)', ['email' => $email]);
+
+            return response()->json(['ok' => true, 'event' => $event, 'customerId' => $id], 200);
+
+        } catch (\Throwable $e) {
+            Log::error('GC handler error', [
+                'event' => $event,
+                'msg'   => $e->getMessage(),
+                'file'  => $e->getFile(),
+                'line'  => $e->getLine(),
+            ]);
+            // ACK to Givecloud so the dashboard doesn’t show failures
+            return response()->json(['status' => 'ok'], 200);
         }
-
-        return response()->json(['ok' => true, 'customerId' => $id], 200);
     }
 
     /* =========================
-     *         Helpers
+     *  Debug endpoints
      * ========================= */
-
-    private function normalizePhone(?string $raw): ?int
-    {
-        if (!$raw) return null;
-        $digits = preg_replace('/\D+/', '', $raw);
-        return $digits !== '' ? (int) $digits : null;
-    }
-
-    private function mapLanguage(?string $label): ?string
-    {
-        if (!$label) return null;
-        $map = [
-            'Punjabi' => '1368ba54-df11-4242-8bc0-5dd7fca6fd45',
-            'English' => '5fee9398-4ef1-4b02-8d0e-0dafbfdff2c0',
-            'Other'   => 'e48318ce-e476-4d26-be9e-58a9142b1193',
-        ];
-        return $map[$label] ?? null;
-    }
-
-    /* =========================
-     *      Debug endpoints
-     * ========================= */
-
     public function debugHsProperties()
     {
         $token = $this->hsAccessToken();
