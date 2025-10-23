@@ -207,8 +207,8 @@ class WebhookController extends Controller
             'province'           => 'state',              // text
             'lifetime_donation'  => 'lifetime-donation',  // number
             'donor_profile_url'  => 'gc-donor-profile',   // url/text
-            // 'phone'            => 'phone-no',           // number (if you decide to use it)
-            // 'preferred_language'=> 'preferred-language',// dropdown (option id)
+            'phone'            => 'phone-no',           // number (if you decide to use it)
+            'preferred_language'=> 'preferred-language',// dropdown (option id)
             // add more slugs only after creating them in HS
         ];
 
@@ -253,27 +253,35 @@ class WebhookController extends Controller
 
     private function verifyGivecloud(Request $r): void
     {
-        $secret = env('GC_WEBHOOK_SECRET');
-        abort_unless($secret, 500, 'Missing GC_WEBHOOK_SECRET');
+        $secret = (string) env('GC_WEBHOOK_SECRET', '');
+        abort_unless($secret !== '', 500, 'Missing GC_WEBHOOK_SECRET');
+
+        // Header from Givecloud (hex SHA1)
         $sig = $r->header('X-Givecloud-Signature') ?? $r->header('x-givecloud-signature');
-        if ($sig) {
-            $raw = $r->getContent(); // raw JSON body
-            $calc = hash_hmac('sha1', $raw, $secret);
-            if (!hash_equals($sig, $calc)) {
-                abort(401, 'Invalid signature');
-            }
-            return;
+
+        // IMPORTANT: use the raw payload exactly as received
+        $raw  = $r->getContent();
+        $calc = hash_hmac('sha1', $raw, $secret);
+
+        // Temporary debug – leave on until it works
+        if (env('GC_LOG_SIG', false)) {
+            Log::debug('GC sig debug', [
+                'received'     => (string) $sig,
+                'calculated'   => (string) $calc,
+                'match'        => $sig && hash_equals((string)$sig, (string)$calc),
+                'len_raw'      => strlen($raw),
+                'len_secret'   => strlen($secret),
+            ]);
         }
 
-        if ($r->header('x-gc-secret') !== $secret) {
-            abort(401, 'Unauthorized');
-        }
+        abort_unless($sig && hash_equals((string)$sig, (string)$calc), 401, 'Invalid signature');
     }
+
 
 
     public function gc(Request $r)
     {
-       $this->verifyGivecloud($r);
+        $this->verifyGivecloud($r);
 
         $b = $r->json()->all();
 
@@ -336,11 +344,11 @@ class WebhookController extends Controller
             'province'           => $province, // maps to "state"
             'lifetime_donation'  => is_numeric($lifetime) ? (float) $lifetime : null,
             // Optional if you add the props:
-            // 'donor_profile_url'  => data_get($b, 'supporter.profile_url') ?: null,
-            // 'phone'              => $this->normalizePhone(data_get($b, 'billing_address.phone')),
-            // 'preferred_language' => $this->mapLanguage(data_get($b, 'supporter.preferred_language')),
-            // 'payment_method'     => $pm,
-            // 'last_donation_amount' => ($amount !== null && $currency) ? "{$amount} {$currency}" : null,
+            'donor_profile_url'  => data_get($b, 'supporter.profile_url') ?: null,
+            'phone'              => $this->normalizePhone(data_get($b, 'billing_address.phone')),
+            'preferred_language' => $this->mapLanguage(data_get($b, 'supporter.preferred_language')),
+            'payment_method'     => $pm,
+            'last_donation_amount' => ($amount !== null && $currency) ? "{$amount} {$currency}" : null,
         ]);
 
         return response()->json(['ok' => true, 'customerId' => $id], 200);
