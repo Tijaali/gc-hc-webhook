@@ -5,6 +5,7 @@ namespace App\Http\Controllers;
 use App\Jobs\ProcessGivecloudEvent;
 use App\Jobs\SyncHelpScoutFromGivecloud;
 use App\Services\HelpScout;
+use App\Services\HelpScoutSync;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\Log;
@@ -42,45 +43,41 @@ class WebhookController extends Controller
 
    public function gc(Request $r)
     {
+        // 1) Verify signature (hard fail if missing/wrong)
         $this->verifyGivecloud($r);
 
-        // Idempotency by Givecloud delivery id (or hash of body)
-        $delivery = (string) ($r->header('X-Givecloud-Delivery') ?? '');
-        if ($delivery === '') {
-            $delivery = sha1($r->getContent());
+        // 2) Idempotency (avoid double-processing the same delivery)
+        $deliveryId = (string)($r->header('X-Givecloud-Delivery') ?? '');
+        if ($deliveryId === '') {
+            $deliveryId = sha1($r->getContent());
         }
-        if (!Cache::add("gc:seen:$delivery", 1, now()->addMinutes(10))) {
-            // Already processed
-            return response()->noContent(202);
+        if (!Cache::add("gc:seen:$deliveryId", 1, now()->addMinutes(15))) {
+            return response()->json(['status' => 'duplicate'], 200);
         }
 
-        $event   = (string) ($r->header('X-Givecloud-Event') ?? 'unknown');
-        $domain  = (string) ($r->header('X-Givecloud-Domain') ?? '');
+        $event   = (string)($r->header('X-Givecloud-Event') ?? 'unknown');
+        $domain  = (string)($r->header('X-Givecloud-Domain') ?? '');
         $payload = $r->json()->all();
 
-        // --- Respond fast ---
-        // Send 202 immediately to Givecloud
-        $resp = response()->noContent(202);
-        $resp->send();
-        if (function_exists('fastcgi_finish_request')) {
-            // Let the web server finish the HTTP response,
-            // then keep running PHP for the HS sync.
-            fastcgi_finish_request();
-        }
-
-        // --- Process inline (no queue worker required) ---
         try {
-            (new ProcessGivecloudEvent($event, $delivery, $domain, $payload))->handle();
+            // 3) Do the full HS sync NOW (synchronous & reliable)
+            (new HelpScoutSync())->run($event, $deliveryId, $domain, $payload);
+
+            // 4) Only after work is done, reply 200
+            return response()->json(['status' => 'ok'], 200);
+
         } catch (\Throwable $e) {
-            Log::error('GC inline handler error', [
-                'event' => $event,
-                'delivery' => $delivery,
-                'err' => $e->getMessage(),
-                'line' => $e->getLine(),
-                'file' => $e->getFile(),
+            Log::error('GC webhook fatal', [
+                'event'    => $event,
+                'delivery' => $deliveryId,
+                'err'      => $e->getMessage(),
+                'line'     => $e->getLine(),
+                'file'     => $e->getFile(),
             ]);
+
+            // 5xx tells Givecloud to retry. Keep payload safe with idempotency key above.
+            return response()->json(['status' => 'error', 'msg' => 'internal'], 500);
         }
-        return;
     }
 
     private function verifyGivecloud(Request $r): void
