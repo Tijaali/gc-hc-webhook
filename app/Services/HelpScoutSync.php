@@ -309,7 +309,6 @@ class HelpScoutSync
         Log::warning('HS find failed', ['email' => $email, 's1' => $r1->status(), 's2' => $r2->status(), 'b2' => $r2->body()]);
         return null;
     }
-
     private function hsCreateCustomerStrict(string $token, ?string $first, ?string $last, string $email): int
     {
         $safeFirst = $first ?: ucfirst(strtolower(strtok($email, '@')));
@@ -322,16 +321,36 @@ class HelpScoutSync
         $r = Http::withToken($token)->acceptJson()->asJson()->timeout(10)
             ->post("{$this->hsApi}/customers", $payload);
 
+        // 201 with Resource-ID header is the success path
+        if ($r->status() === 201) {
+            $rid = (string)($r->header('Resource-ID') ?? '');
+            if ($rid !== '' && ctype_digit($rid)) {
+                Log::info('HS create: 201 with Resource-ID', ['id' => (int)$rid]);
+                return (int)$rid;
+            }
+            // Some proxies drop headers; fall back to Location
+            $loc = (string)($r->header('Location') ?? '');
+            if ($loc && preg_match('~/customers/(\d+)~', $loc, $m)) {
+                Log::info('HS create: 201, parsed id from Location', ['id' => (int)$m[1]]);
+                return (int)$m[1];
+            }
+            Log::warning('HS create: 201 but no Resource-ID/Location', ['headers' => $r->headers()]);
+            throw new SyncAbort('HS create returned 201 but no id header');
+        }
+
         if ($r->status() === 409) {
             $existing = $this->hsFindCustomer($token, $email);
-            if ($existing && isset($existing['id'])) return (int)$existing['id'];
+            if ($existing && isset($existing['id'])) {
+                Log::info('HS create: 409 conflict → using existing id', ['id' => (int)$existing['id']]);
+                return (int)$existing['id'];
+            }
             throw new SyncAbort('HS create conflict but could not fetch existing');
         }
 
-        if ($r->successful()) return (int)($r->json('id') ?? 0);
-
+        Log::warning('HS create failed', ['status' => $r->status(), 'body' => substr($r->body(), 300)]);
         throw new SyncAbort('HS create failed: ' . $r->status() . ' ' . $r->body());
     }
+
 
     private function hsUpdateCoreSoft(string $token, int $id, array $b): void
     {
@@ -387,6 +406,64 @@ class HelpScoutSync
         return collect(data_get($r->json(), '_embedded.customer-properties', []))
             ->pluck('slug')->filter()->values()->all();
     }
+    private function ensureCustomerPropertiesExist(string $token, array $needSlugs): void
+    {
+        // Fetch current slugs
+        $r = Http::withToken($token)->timeout(8)->get("{$this->hsApi}/customer-properties");
+        if (!$r->ok()) throw new SyncAbort('HS properties list failed: ' . $r->status() . ' ' . $r->body());
+
+        $existing = collect(data_get($r->json(), '_embedded.customer-properties', []))
+            ->pluck('slug')->all();
+
+        $toCreate = array_values(array_diff($needSlugs, $existing));
+        if (!$toCreate) return;
+
+        // Choose types for each slug (number/text/url/date/dropdown)
+        $typeMap = [
+            'donor-id'             => 'number',
+            'lifetime-donation'    => 'number',
+            'phone-no'             => 'text',
+            'donor-since'          => 'date',
+            'last-order'           => 'date',
+            'last-donation-amount' => 'text',
+            'payment-status'       => 'text',
+            'payment-method'       => 'text',
+            'transaction-type'     => 'text',
+            'recurring-summary'    => 'text',
+            'recurring-status'     => 'text',
+            'gc-donor-profile'     => 'url',
+            'sponsorship-name'     => 'text',
+            'sponsorship-ref'      => 'text',
+            'sponsorship-url'      => 'url',
+            'country'              => 'text',
+            'state'                => 'text',
+            'billing-address1'     => 'text',
+            'billing-city'         => 'text',
+            'billing-postal'       => 'text',
+        ];
+
+        foreach ($toCreate as $slug) {
+            $type = $typeMap[$slug] ?? 'text';
+            $name = ucwords(str_replace(['-', '_'], ' ', $slug));
+            $resp = Http::withToken($token)->acceptJson()->asJson()->timeout(10)
+                ->post("{$this->hsApi}/customer-properties", [
+                    'type' => $type,
+                    'slug' => $slug,
+                    'name' => $name,
+                ]);
+            if (!$resp->created()) {
+                Log::warning('HS property create failed', [
+                    'slug' => $slug,
+                    'type' => $type,
+                    'status' => $resp->status(),
+                    'body' => substr($resp->body(), 200),
+                ]);
+            } else {
+                Log::info('HS property created', ['slug' => $slug, 'type' => $type]);
+            }
+        }
+    }
+
 
     private function hsPatchPropertiesStrict(string $token, int $customerId, array $kv): void
     {
@@ -426,7 +503,28 @@ class HelpScoutSync
         if ($missingRequired) {
             throw new SyncAbort('Missing required HS custom properties: ' . implode(', ', $missingRequired));
         }
-
+        $this->ensureCustomerPropertiesExist($token, array_values([
+            'donor-id',
+            'donor-since',
+            'lifetime-donation',
+            'gc-donor-profile',
+            'last-order',
+            'last-donation-amount',
+            'payment-status',
+            'payment-method',
+            'transaction-type',
+            'recurring-summary',
+            'recurring-status',
+            'sponsorship-name',
+            'sponsorship-ref',
+            'sponsorship-url',
+            'country',
+            'state',
+            'phone-no',
+            'billing-address1',
+            'billing-city',
+            'billing-postal',
+        ]));
         $ops = [];
         foreach ($kv as $concept => $val) {
             if ($val === null || $val === '') continue;
