@@ -22,11 +22,12 @@ class HelpScoutSync
         $b = $this->normalize($event, $body);
 
         $email = $this->firstNonEmpty([
-            'email',
             'supporter.email',
             'billing_address.email',
             'account.email',
             'customer.email',
+            // last resort: top-level email from order payload
+            'email',
         ], $b);
         if (!$email) throw new SyncAbort('No donor email in payload');
 
@@ -309,6 +310,18 @@ class HelpScoutSync
         Log::warning('HS find failed', ['email' => $email, 's1' => $r1->status(), 's2' => $r2->status(), 'b2' => $r2->body()]);
         return null;
     }
+    private function hsFindCustomerWithRetry(string $token, string $email, int $attempts = 4, int $baseMs = 200): ?array
+    {
+        for ($i = 1; $i <= $attempts; $i++) {
+            $hit = $this->hsFindCustomer($token, $email);
+            if ($hit) return $hit;
+
+            // jittered backoff: 200ms, 400ms, 800ms, 1200ms-ish
+            usleep(($baseMs * $i + random_int(0, 60)) * 1000);
+        }
+        return null;
+    }
+
     private function hsCreateCustomerStrict(string $token, ?string $first, ?string $last, string $email): int
     {
         $safeFirst = $first ?: ucfirst(strtolower(strtok($email, '@')));
@@ -339,9 +352,9 @@ class HelpScoutSync
         }
 
         if ($r->status() === 409) {
-            $existing = $this->hsFindCustomer($token, $email);
+            $existing = $this->hsFindCustomerWithRetry($token, $email);  // ⬅️ retry here
             if ($existing && isset($existing['id'])) {
-                Log::info('HS create: 409 conflict → using existing id', ['id' => (int)$existing['id']]);
+                Log::info('HS create: 409 conflict → using existing id (after retry)', ['id' => (int)$existing['id']]);
                 return (int)$existing['id'];
             }
             throw new SyncAbort('HS create conflict but could not fetch existing');
@@ -555,9 +568,12 @@ class HelpScoutSync
         $r = Http::withToken($token)->acceptJson()->asJson()->timeout(10)
             ->patch("{$this->hsApi}/customers/{$customerId}/properties", $payload);
 
-        if (!$r->ok()) {
-            throw new SyncAbort('HS properties failed: ' . $r->status() . ' ' . $r->body());
+        // ✅ treat 200 and 204 as success
+        if (!in_array($r->status(), [200, 204], true)) {
+            throw new SyncAbort('HS properties failed: ' . $r->status() . ' ' . substr($r->body(), 250));
         }
+
+        Log::info('HS props: PATCH OK', ['status' => $r->status(), 'ops' => count($ops)]);
     }
 
     /* ---------- utils ---------- */
