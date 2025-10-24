@@ -188,42 +188,99 @@ class HelpScoutSync
     /* ---------- Help Scout API (STRICT) ---------- */
     private function hsAccessTokenStrict(): string
     {
-        $token = Cache::remember('hs_access_token', now()->addMinutes(30), function () {
-            $refresh = (string) (Cache::get('hs_refresh_file') ?? env('HS_REFRESH_TOKEN', ''));
-            if ($refresh === '') {
-                try {
-                    $path = 'hs_oauth.json';
-                    if (\Illuminate\Support\Facades\Storage::exists($path)) {
-                        $saved = json_decode(\Illuminate\Support\Facades\Storage::get($path), true);
-                        if (!empty($saved['refresh_token'])) {
-                            $refresh = (string) $saved['refresh_token'];
-                        }
-                    }
-                } catch (\Throwable $e) {
+        // 0) Try a straight cache get (so we can log hit/miss)
+        if ($cached = \Illuminate\Support\Facades\Cache::get('hs_access_token')) {
+            \Illuminate\Support\Facades\Log::info('HS token: access cache HIT');
+            return (string)$cached;
+        }
+        \Illuminate\Support\Facades\Log::info('HS token: access cache MISS → refreshing from refresh_token');
+
+        // 1) Find refresh token (prefer file, then cache)
+        $refresh = '';
+        $refreshSrc = 'none';
+        try {
+            $path = 'hs_oauth.json';
+            if (\Illuminate\Support\Facades\Storage::exists($path)) {
+                $saved = json_decode(\Illuminate\Support\Facades\Storage::get($path), true);
+                if (!empty($saved['refresh_token'])) {
+                    $refresh = (string) $saved['refresh_token'];
+                    $refreshSrc = 'file';
                 }
             }
+        } catch (\Throwable $e) {
+            \Illuminate\Support\Facades\Log::warning('HS token: error reading hs_oauth.json', ['err' => $e->getMessage()]);
+        }
 
-            if ($refresh === '') throw new SyncAbort('Missing HS_REFRESH_TOKEN');
+        if ($refresh === '') {
+            $refresh = (string) (\Illuminate\Support\Facades\Cache::get('hs_refresh_file') ?? '');
+            if ($refresh !== '') $refreshSrc = 'cache';
+        }
 
-            $resp = Http::asForm()->timeout(8)->post($this->hsTokenUrl, [
-                'grant_type'    => 'refresh_token',
-                'refresh_token' => $refresh,
-                'client_id'     => env('HS_CLIENT_ID'),
-                'client_secret' => env('HS_CLIENT_SECRET'),
+        if ($refresh === '') {
+            \Illuminate\Support\Facades\Log::error('HS token: NO refresh token available (re-auth required at /oauth/hs/start)');
+            throw new SyncAbort('Missing HS refresh token (re-auth at /oauth/hs/start)');
+        }
+
+        $rfHash = substr(sha1($refresh), 0, 10);
+        \Illuminate\Support\Facades\Log::info('HS token: using refresh token', ['source' => $refreshSrc, 'rf_hash' => $rfHash]);
+
+        // 2) Refresh
+        $resp = \Illuminate\Support\Facades\Http::asForm()->timeout(8)->post($this->hsTokenUrl, [
+            'grant_type'    => 'refresh_token',
+            'refresh_token' => $refresh,
+            'client_id'     => env('HS_CLIENT_ID'),
+            'client_secret' => env('HS_CLIENT_SECRET'),
+        ]);
+
+        if (!$resp->ok()) {
+            \Illuminate\Support\Facades\Log::error('HS token: refresh FAILED', [
+                'status' => $resp->status(),
+                'body'   => $resp->body(),
+                'rf_src' => $refreshSrc,
+                'rf_hash' => $rfHash,
             ]);
-            if (!$resp->ok()) {
-                throw new SyncAbort('HS token refresh failed: ' . $resp->status() . ' ' . $resp->body());
-            }
-            $data = $resp->json();
-            if (!empty($data['refresh_token'])) {
-                Cache::forever('hs_refresh_file', (string)$data['refresh_token']);
-            }
-            return (string) ($data['access_token'] ?? '');
-        });
+            throw new SyncAbort('HS token refresh failed: ' . $resp->status() . ' ' . $resp->body());
+        }
 
-        if ($token === '') throw new SyncAbort('Empty HS access token');
-        return $token;
+        $data    = $resp->json();
+        $access  = (string) ($data['access_token'] ?? '');
+        $expires = (int) ($data['expires_in'] ?? 1800);
+        if ($access === '') {
+            \Illuminate\Support\Facades\Log::error('HS token: empty access token after refresh');
+            throw new SyncAbort('Empty HS access token');
+        }
+
+        // 3) Persist rotated refresh (if any) to BOTH file + cache
+        $rotated = false;
+        if (!empty($data['refresh_token'])) {
+            $newRefresh = (string)$data['refresh_token'];
+            $newHash    = substr(sha1($newRefresh), 0, 10);
+
+            \Illuminate\Support\Facades\Storage::put('hs_oauth.json', json_encode([
+                'refresh_token' => $newRefresh,
+                'saved_at'      => now()->toISOString(),
+            ], JSON_PRETTY_PRINT));
+            \Illuminate\Support\Facades\Cache::forever('hs_refresh_file', $newRefresh);
+
+            $rotated = true;
+            \Illuminate\Support\Facades\Log::info('HS token: refresh token ROTATED', [
+                'old_rf_hash' => $rfHash,
+                'new_rf_hash' => $newHash,
+            ]);
+        }
+
+        // 4) Cache access token with early refresh margin (−60s)
+        $ttl = max($expires - 60, 60);
+        \Illuminate\Support\Facades\Cache::put('hs_access_token', $access, now()->addSeconds($ttl));
+        \Illuminate\Support\Facades\Log::info('HS token: access token cached', [
+            'ttl_sec' => $ttl,
+            'rf_src'  => $refreshSrc,
+            'rotated' => $rotated,
+        ]);
+
+        return $access;
     }
+
 
     private function hsFindCustomer(string $token, string $email): ?array
     {

@@ -81,15 +81,22 @@ class HelpScout
         $env = env('HS_REFRESH_TOKEN');
         return $env ? (string)$env : null;
     }
-
     private function saveRefreshToken(string $token): void
     {
-        Storage::put('hs_oauth.json', json_encode([
+        \Illuminate\Support\Facades\Storage::put('hs_oauth.json', json_encode([
             'refresh_token' => $token,
             'saved_at'      => now()->toISOString(),
         ], JSON_PRETTY_PRINT));
+
+        // keep cache in sync
         \Illuminate\Support\Facades\Cache::forever('hs_refresh_file', $token);
+
+        \Illuminate\Support\Facades\Log::info('HS OAuth: refresh token saved', [
+            'rf_hash' => substr(sha1($token), 0, 10),
+            'to'      => ['file' => true, 'cache' => true],
+        ]);
     }
+
 
 
     /* =========================

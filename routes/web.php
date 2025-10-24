@@ -12,13 +12,27 @@ Route::get('/', function () {
 });
 Route::get('/health', fn () => response()->json(['ok' => true]));
 Route::get('/debug/hs', function () {
+    $fileHas = false;
+    $fileHash = null;
+    if (Storage::exists('hs_oauth.json')) {
+        $j = json_decode(Storage::get('hs_oauth.json'), true) ?: [];
+        if (!empty($j['refresh_token'])) {
+            $fileHas = true;
+            $fileHash = substr(sha1((string)$j['refresh_token']), 0, 10);
+        }
+    }
+    $cacheRf = Cache::get('hs_refresh_file');
     return [
-        'cache_refresh' => (bool) Cache::get('hs_refresh_file'),
-        'env_refresh'   => env('HS_REFRESH_TOKEN') ? 'set' : 'missing',
-        'file_refresh'  => Storage::exists('hs_oauth.json') ? (bool) data_get(json_decode(Storage::get('hs_oauth.json'), true), 'refresh_token') : false,
-        'access_cached' => (bool) Cache::get('hs_access_token'),
+        'access_cached'   => (bool) Cache::get('hs_access_token'),
+        'refresh_in_file' => $fileHas,
+        'refresh_file_hash' => $fileHash,
+        'refresh_in_cache'=> (bool) $cacheRf,
+        'refresh_cache_hash' => $cacheRf ? substr(sha1((string)$cacheRf), 0, 10) : null,
+        'cache_driver'    => config('cache.default'),
+        'redirect_uri'    => env('HS_REDIRECT_URI'),
     ];
 });
+
 
 Route::get('/oauth/hs/start', [WebhookController::class, 'hsStart']);
 Route::get('/oauth/hs/callback', [WebhookController::class, 'hsCallback']);
