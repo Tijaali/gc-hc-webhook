@@ -345,8 +345,20 @@ class HelpScoutSync
         }
         return null;
     }
+    private function hsUpdateCustomerProfile(string $token, int $id, array $payload): void
+    {
+        $r = Http::withToken($token)->acceptJson()->asJson()->timeout(10)
+            ->patch("{$this->hsApi}/customers/{$id}", $payload);
 
-    private function hsCreateCustomerStrict(string $token, ?string $first, ?string $last, string $email): int
+        if (!in_array($r->status(), [200, 204], true)) {
+            Log::warning('HS update failed', ['id' => $id, 'status' => $r->status(), 'body' => substr($r->body(), 250)]);
+        } else {
+            Log::info('HS update: PATCH OK', ['id' => $id, 'payload' => $payload]);
+        }
+    }
+
+
+    private function hsCreateCustomerStrict(string $token, ?string $first, ?string $last, string $email, ?array $b = []): int
     {
         $safeFirst = $first ?: ucfirst(strtolower(strtok($email, '@')));
         $payload = [
@@ -355,25 +367,55 @@ class HelpScoutSync
             'emails'    => [['type' => 'work', 'value' => $email]],
         ];
 
+        // Add phone if available
+        $phone = data_get($b, 'billing_address.phone') ?? data_get($b, 'supporter.billing_address.phone');
+        if ($phone) {
+            $payload['phones'] = [['type' => 'mobile', 'value' => $phone]];
+        }
+
+        // Add address if available
+        $addr = data_get($b, 'billing_address') ?? data_get($b, 'supporter.billing_address');
+        if ($addr) {
+            $payload['addresses'] = [[
+                'lines'      => array_filter([$addr['address1'] ?? null, $addr['address2'] ?? null]),
+                'city'       => $addr['city'] ?? null,
+                'state'      => $addr['state'] ?? $addr['province_code'] ?? null,
+                'postalCode' => $addr['zip'] ?? null,
+                'country'    => $addr['country'] ?? $addr['country_code'] ?? null,
+                'type'       => 'work',
+            ]];
+        }
+
         $r = Http::withToken($token)->acceptJson()->asJson()->timeout(10)
             ->post("{$this->hsApi}/customers", $payload);
 
         if ($r->status() === 201) {
             $rid = (string)($r->header('Resource-ID') ?? '');
-            if ($rid !== '' && ctype_digit($rid)) return (int)$rid;
+            if ($rid !== '' && ctype_digit($rid)) {
+                Log::info('HS create: 201 with Resource-ID', ['id' => (int)$rid, 'payload' => $payload]);
+                return (int)$rid;
+            }
             $loc = (string)($r->header('Location') ?? '');
-            if ($loc && preg_match('~/customers/(\d+)~', $loc, $m)) return (int)$m[1];
+            if ($loc && preg_match('~/customers/(\d+)~', $loc, $m)) {
+                Log::info('HS create: 201, parsed id from Location', ['id' => (int)$m[1], 'payload' => $payload]);
+                return (int)$m[1];
+            }
             throw new SyncAbort('HS create returned 201 but no id header');
         }
 
         if ($r->status() === 409) {
             $existing = $this->hsFindCustomerWithRetry($token, $email);
-            if ($existing && isset($existing['id'])) return (int)$existing['id'];
+            if ($existing && isset($existing['id'])) {
+                $this->hsUpdateCustomerProfile($token, $existing['id'], $payload);
+                return (int)$existing['id'];
+            }
             throw new SyncAbort('HS create conflict but could not fetch existing');
         }
 
+        Log::warning('HS create failed', ['status' => $r->status(), 'body' => substr($r->body(), 300)]);
         throw new SyncAbort('HS create failed: ' . $r->status() . ' ' . $r->body());
     }
+
 
     private function hsPatchClientPropertiesStrict(string $token, int $customerId, array $kv, bool $sparse = true): void
     {
