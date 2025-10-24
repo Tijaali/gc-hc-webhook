@@ -15,15 +15,10 @@ class HelpScoutSync
     private string $hsTokenUrl = 'https://api.helpscout.net/v2/oauth2/token';
     private string $hsApi      = 'https://api.helpscout.net/v2';
 
-    /**
-     * Entry point used by WebhookController.
-     * Throws on critical failures so controller can 500 (and GC retries).
-     */
     public function runStrict(string $event, string $delivery, string $domain, array $body): void
     {
         $b = $this->normalize($event, $body);
 
-        // Resolve donor email (required to find/create HS customer)
         $email = $this->firstNonEmpty([
             'account.email',
             'supporter.email',
@@ -35,34 +30,34 @@ class HelpScoutSync
 
         $token = $this->hsAccessTokenStrict();
 
-        // Find or create HS customer
+        // find/create HS customer
         $cust = $this->hsFindCustomerWithRetry($token, $email);
         $id   = $cust['id'] ?? 0;
         if (!$id) {
-            $first = $this->firstNonEmpty(['account.first_name', 'supporter.first_name', 'billing_address.first_name'], $b);
-            $last  = $this->firstNonEmpty(['account.last_name',  'supporter.last_name',  'billing_address.last_name'],  $b);
+            $first = $this->firstNonEmpty(['account.first_name','supporter.first_name','billing_address.first_name'], $b);
+            $last  = $this->firstNonEmpty(['account.last_name','supporter.last_name','billing_address.last_name'],  $b);
             $id    = $this->hsCreateCustomerStrict($token, $first, $last, $email);
         }
         if (!$id) throw new SyncAbort('Could not resolve or create HS customer');
 
-        // Build & upsert exactly the fields the client wants
+        // Build properties from whatever this event carries
         $props = $this->buildClientProperties($b);
-        $this->hsPatchClientPropertiesStrict($token, $id, $props);
 
-        Log::info('HS_SYNC_OK', compact('event', 'delivery', 'email') + ['customerId' => $id]);
+        // IMPORTANT: sparse patch — only send fields we actually have values for.
+        // This avoids wiping donation fields when a later supporter_updated arrives.
+        $this->hsPatchClientPropertiesStrict($token, $id, $props, /*sparse=*/true);
+
+        Log::info('HS_SYNC_OK', compact('event','delivery','email') + ['customerId' => $id]);
     }
 
-    /* ---------------------------------------------------------------------
-     | Normalization
-     * --------------------------------------------------------------------*/
+    /* ---------------- Normalization ---------------- */
+
     private function normalize(string $event, array $b): array
     {
-        // supporter_updated: lift supporter[0] into flat fields
         if (isset($b['supporters'][0])) {
             $b['supporter'] = $b['supporters'][0];
             $b['email'] = $b['supporter']['email']
                 ?? ($b['billing_address']['email'] ?? ($b['supporter']['billing_address']['email'] ?? null));
-
             if (!isset($b['billing_address']) && isset($b['supporter']['billing_address'])) {
                 $b['billing_address'] = $b['supporter']['billing_address'];
             }
@@ -71,19 +66,16 @@ class HelpScoutSync
             }
         }
 
-        // If a recurring_profile exists, mirror key bits into line_items[0]
         if (isset($b['recurring_profile']) && is_array($b['recurring_profile'])) {
             $rp = $b['recurring_profile'];
             $b['line_items'][0]['recurring_profile'] = $rp;
             $b['line_items'][0]['recurring_amount']  = $rp['amount'] ?? ($b['line_items'][0]['recurring_amount'] ?? null);
             $b['line_items'][0]['recurring_day']     = $this->extractDayNumber($rp['billing_period_day'] ?? null);
 
-            // Currency hint
             if (!isset($b['currency'])) {
                 $b['currency'] = data_get($rp, 'currency.code') ?: data_get($rp, 'currency.iso_code');
             }
 
-            // Payment brand/type signal
             $acctType = data_get($rp, 'payment_method.account_type') ?: data_get($rp, 'payment_method.display_name');
             if ($acctType) {
                 $b['payments'][0]['type']          = 'card';
@@ -95,21 +87,26 @@ class HelpScoutSync
         return $b;
     }
 
-    /* ---------------------------------------------------------------------
-     | Build the EXACT client properties (concept names → values)
-     * --------------------------------------------------------------------*/
+    /* --------------- Build client properties --------------- */
+
     private function buildClientProperties(array $b): array
     {
-        // Name (Donor Identity)
+        // Name
         $first = $this->firstNonEmpty(['account.first_name','supporter.first_name','billing_address.first_name'], $b);
-        $last  = $this->firstNonEmpty(['account.last_name','supporter.last_name','billing_address.last_name'], $b);
+        $last  = $this->firstNonEmpty(['account.last_name','supporter.last_name','billing_address.last_name'],  $b);
         $donorIdentity = trim(implode(' ', array_filter([$first, $last])));
 
-        // Donor ID: account.email → account.id → vendor_contact_id
-        $donorId = $this->firstNonEmpty(['account.email','account.id','vendor_contact_id'], $b);
+        // Donor ID (broadened)
+        $donorId = $this->firstNonEmpty([
+            'account.email',
+            'account.id',
+            'supporter.id',          // GC string id like "XPGE93E4"
+            'supporter.id_deprecated',
+            'vendor_contact_id',
+        ], $b);
         if (is_array($donorId) || is_object($donorId)) $donorId = null;
 
-        // Last Donation Amount: "<amount> <currency>"
+        // Last Donation Amount
         $amount   = $this->firstNonEmpty(['total_amount','subtotal_amount','amount','line_items.0.recurring_amount'], $b);
         $currency = $this->firstNonEmpty(['currency','payments.0.currency.code','line_items.0.recurring_profile.currency.code'], $b);
         $lastDonationAmount = ($amount !== null && $currency)
@@ -119,47 +116,44 @@ class HelpScoutSync
         // Last Donation Date
         $lastDonationDate = $this->dateOnly($this->firstNonEmpty(['created_at','ordered_at'], $b));
 
-        // Recurring Details: "$X / Monthly / 1st of Month"
+        // Recurring Details
         $recurringDetails = $this->buildRecurringDetails($b);
 
-        // Sponsorship Info (+ helpful tickets) "Full Name, REF, URL"
+        // Sponsorship Info
         $li = data_get($b, 'line_items.0');
         $sName = data_get($li, 'sponsorship.full_name') ?: data_get($li, 'sponsee.full_name');
         $sRef  = data_get($li, 'sponsorship.reference_number') ?: data_get($li, 'reference');
         $sUrl  = data_get($li, 'sponsorship.url') ?: data_get($li, 'public_url');
         $sponsorshipInfo = $this->joinPretty([$sName, $sRef, $sUrl], ', ');
 
-        // Location (single field): "Country / Province"
+        // Location ("Country / Province")
         $country  = $this->firstNonEmpty(['billing_address.country','billing_address.country_code','supporter.billing_address.country'], $b);
         $province = $this->firstNonEmpty(['billing_address.state','billing_address.province_code','supporter.billing_address.state'], $b);
         $location = ($country || $province) ? trim(($country ?: '') . ' / ' . ($province ?: '')) : null;
 
-        // Payment Method normalized (Card / Visa, Wallet / Google Pay, etc.)
+        // Payment Method
         $paymentMethod = $this->formatPaymentMethod($b);
 
-        // Email + Phone
-        $email = $this->firstNonEmpty([
-            'account.email','supporter.email','billing_address.email','customer.email','email',
-        ], $b);
-        $phone = $this->firstNonEmpty(['billing_address.phone','supporter.billing_address.phone'], $b);
-        $phone = $this->cleanPhone($phone);
+        // Email & Phone
+        $email = $this->firstNonEmpty(['account.email','supporter.email','billing_address.email','customer.email','email'], $b);
+        $phone = $this->cleanPhone($this->firstNonEmpty(['billing_address.phone','supporter.billing_address.phone'], $b));
 
-        // GC Donor Profile (if present)
+        // GC Donor Profile
         $gcProfile = $this->firstNonEmpty(['supporter.profile_url','line_items.0.public_url'], $b);
 
         return [
-            'donor_identity' => $donorIdentity,
-            'donor_id'       => $donorId,
-            'last_amt'       => $lastDonationAmount,
-            'last_date'      => $lastDonationDate,
-            'recur'          => $recurringDetails,
-            'sponsor_help'   => $sponsorshipInfo,
-            'sponsor_info'   => $sponsorshipInfo,
-            'location'       => $location,
-            'pay_method'     => $paymentMethod,
-            'phone'          => $phone,
-            'email'          => $email,
-            'gc_profile'     => $gcProfile,
+            'donor_identity' => $donorIdentity ?: null,
+            'donor_id'       => $donorId ?: null,
+            'last_amt'       => $lastDonationAmount ?: null,
+            'last_date'      => $lastDonationDate ?: null,
+            'recur'          => $recurringDetails ?: null,
+            'sponsor_help'   => $sponsorshipInfo ?: null,
+            'sponsor_info'   => $sponsorshipInfo ?: null,
+            'location'       => $location ?: null,
+            'pay_method'     => $paymentMethod ?: null,
+            'phone'          => $phone ?: null,
+            'email'          => $email ?: null,
+            'gc_profile'     => $gcProfile ?: null,
         ];
     }
 
@@ -211,14 +205,14 @@ class HelpScoutSync
             $k = strtolower(trim($s));
             return match ($k) {
                 'visa' => 'Visa',
-                'master', 'mc', 'mastercard', 'master card' => 'MasterCard',
-                'amex', 'american express', 'americanexpress' => 'American Express',
+                'master','mc','mastercard','master card' => 'MasterCard',
+                'amex','american express','americanexpress' => 'American Express',
                 'discover' => 'Discover',
-                'diners', 'diners club', 'dinersclub' => 'Diners Club',
+                'diners','diners club','dinersclub' => 'Diners Club',
                 'jcb' => 'JCB',
-                'unionpay', 'china unionpay' => 'UnionPay',
-                'google_pay', 'google pay' => 'Google Pay',
-                'apple_pay', 'apple pay' => 'Apple Pay',
+                'unionpay','china unionpay' => 'UnionPay',
+                'google_pay','google pay' => 'Google Pay',
+                'apple_pay','apple pay' => 'Apple Pay',
                 'paypal' => 'PayPal',
                 default => ucwords($k),
             };
@@ -236,9 +230,8 @@ class HelpScoutSync
         return $brand ?: null;
     }
 
-    /* ---------------------------------------------------------------------
-     | Help Scout API (token, customer, properties)
-     * --------------------------------------------------------------------*/
+    /* --------------- Help Scout API --------------- */
+
     private function hsAccessTokenStrict(): string
     {
         if ($cached = Cache::get('hs_access_token')) {
@@ -293,8 +286,8 @@ class HelpScoutSync
             ]);
 
             if (!$resp->ok()) {
-                Log::error('HS token: refresh FAILED', ['status' => $resp->status(), 'body' => $resp->body(), 'rf_src' => $src, 'rf_hash' => $rfHash]);
-                throw new SyncAbort('HS token refresh failed: ' . $resp->status() . ' ' . $resp->body());
+                Log::error('HS token: refresh FAILED', ['status'=>$resp->status(),'body'=>$resp->body(),'rf_src'=>$src,'rf_hash'=>$rfHash]);
+                throw new SyncAbort('HS token refresh failed: '.$resp->status().' '.$resp->body());
             }
 
             $data    = $resp->json();
@@ -304,14 +297,14 @@ class HelpScoutSync
 
             if (!empty($data['refresh_token'])) {
                 $new = (string)$data['refresh_token'];
-                Storage::put('hs_oauth.json', json_encode(['refresh_token' => $new, 'saved_at' => now()->toISOString()], JSON_PRETTY_PRINT));
+                Storage::put('hs_oauth.json', json_encode(['refresh_token'=>$new,'saved_at'=>now()->toISOString()], JSON_PRETTY_PRINT));
                 Cache::forever('hs_refresh_file', $new);
-                Log::info('HS token: refresh token ROTATED', ['old_rf_hash' => $rfHash, 'new_rf_hash' => substr(sha1($new), 0, 10)]);
+                Log::info('HS token: refresh token ROTATED', ['old_rf_hash'=>$rfHash,'new_rf_hash'=>substr(sha1($new),0,10)]);
             }
 
             $ttl = max($expires - 60, 60);
             Cache::put('hs_access_token', $access, now()->addSeconds($ttl));
-            Log::info('HS token: access token cached', ['ttl_sec' => $ttl, 'rf_src' => $src]);
+            Log::info('HS token: access token cached', ['ttl_sec'=>$ttl,'rf_src'=>$src]);
 
             return $access;
         } finally {
@@ -321,20 +314,20 @@ class HelpScoutSync
 
     private function hsFindCustomer(string $token, string $email): ?array
     {
-        $r1 = Http::withToken($token)->timeout(8)->get("{$this->hsApi}/customers", ['email' => $email, 'page' => 1]);
+        $r1 = Http::withToken($token)->timeout(8)->get("{$this->hsApi}/customers", ['email'=>$email,'page'=>1]);
         if ($r1->ok()) {
             $hit = data_get($r1->json(), '_embedded.customers.0');
             if ($hit) return $hit;
         }
 
         $q  = '(email:"' . addslashes($email) . '")';
-        $r2 = Http::withToken($token)->timeout(8)->get("{$this->hsApi}/customers", ['query' => $q, 'page' => 1]);
+        $r2 = Http::withToken($token)->timeout(8)->get("{$this->hsApi}/customers", ['query'=>$q,'page'=>1]);
         if ($r2->ok()) {
             $hit = data_get($r2->json(), '_embedded.customers.0');
             if ($hit) return $hit;
         }
 
-        Log::warning('HS find failed', ['email' => $email, 's1' => $r1->status(), 's2' => $r2->status(), 'b2' => $r2->body()]);
+        Log::warning('HS find failed', ['email'=>$email,'s1'=>$r1->status(),'s2'=>$r2->status(),'b2'=>$r2->body()]);
         return null;
     }
 
@@ -354,7 +347,7 @@ class HelpScoutSync
         $payload = [
             'firstName' => $safeFirst,
             'lastName'  => $last ?: null,
-            'emails'    => [['type' => 'work', 'value' => $email]],
+            'emails'    => [['type'=>'work','value'=>$email]],
         ];
 
         $r = Http::withToken($token)->acceptJson()->asJson()->timeout(10)
@@ -362,39 +355,28 @@ class HelpScoutSync
 
         if ($r->status() === 201) {
             $rid = (string)($r->header('Resource-ID') ?? '');
-            if ($rid !== '' && ctype_digit($rid)) {
-                Log::info('HS create: 201 with Resource-ID', ['id' => (int)$rid]);
-                return (int)$rid;
-            }
+            if ($rid !== '' && ctype_digit($rid)) return (int)$rid;
             $loc = (string)($r->header('Location') ?? '');
-            if ($loc && preg_match('~/customers/(\d+)~', $loc, $m)) {
-                Log::info('HS create: 201, parsed id from Location', ['id' => (int)$m[1]]);
-                return (int)$m[1];
-            }
-            Log::warning('HS create: 201 but no id header', ['headers' => $r->headers()]);
+            if ($loc && preg_match('~/customers/(\d+)~', $loc, $m)) return (int)$m[1];
             throw new SyncAbort('HS create returned 201 but no id header');
         }
 
         if ($r->status() === 409) {
             $existing = $this->hsFindCustomerWithRetry($token, $email);
-            if ($existing && isset($existing['id'])) {
-                Log::info('HS create: 409 conflict → using existing id (after retry)', ['id' => (int)$existing['id']]);
-                return (int)$existing['id'];
-            }
+            if ($existing && isset($existing['id'])) return (int)$existing['id'];
             throw new SyncAbort('HS create conflict but could not fetch existing');
         }
 
-        Log::warning('HS create failed', ['status' => $r->status(), 'body' => substr($r->body(), 300)]);
-        throw new SyncAbort('HS create failed: ' . $r->status() . ' ' . $r->body());
+        throw new SyncAbort('HS create failed: '.$r->status().' '.$r->body());
     }
 
     /**
-     * Upserts ONLY the client’s properties.
-     * Always writes every property; sends "" to clear if missing.
+     * Upserts only the client properties.
+     * If $sparse = true, we ONLY send fields that have non-empty values.
+     * (Prevents wiping donation data when supporter_updated lacks those fields.)
      */
-    private function hsPatchClientPropertiesStrict(string $token, int $customerId, array $kv): void
+    private function hsPatchClientPropertiesStrict(string $token, int $customerId, array $kv, bool $sparse = true): void
     {
-        // Required property slugs with display names and types
         $need = [
             'donor-identity'                  => ['Name',                             'text'],
             'donor-id'                        => ['Donor ID',                         'text'],
@@ -410,27 +392,23 @@ class HelpScoutSync
             'gc-donor-profile'                => ['GC Donor Profile',                 'url'],
         ];
 
-        // Fetch existing slugs
+        // ensure properties exist
         $r = Http::withToken($token)->timeout(8)->get("{$this->hsApi}/customer-properties");
         if (!$r->ok()) throw new SyncAbort('HS properties list failed: '.$r->status().' '.$r->body());
-
         $existing = collect(data_get($r->json(), '_embedded.customer-properties', []))
             ->pluck('slug')->all();
 
-        // Create any missing
         foreach ($need as $slug => [$name, $type]) {
             if (in_array($slug, $existing, true)) continue;
             $resp = Http::withToken($token)->acceptJson()->asJson()->timeout(10)
-                ->post("{$this->hsApi}/customer-properties", ['type'=>$type, 'slug'=>$slug, 'name'=>$name]);
+                ->post("{$this->hsApi}/customer-properties", ['type'=>$type,'slug'=>$slug,'name'=>$name]);
             if ($resp->created()) {
-                Log::info('HS property created', ['slug'=>$slug, 'type'=>$type]);
                 $existing[] = $slug;
             } else {
-                Log::warning('HS property create failed', ['slug'=>$slug, 'status'=>$resp->status(), 'body'=>substr($resp->body(), 200)]);
+                Log::warning('HS property create failed', ['slug'=>$slug,'status'=>$resp->status(),'body'=>substr($resp->body(),200)]);
             }
         }
 
-        // Concept → slug mapping
         $slugMap = [
             'donor_identity' => 'donor-identity',
             'donor_id'       => 'donor-id',
@@ -446,19 +424,31 @@ class HelpScoutSync
             'gc_profile'     => 'gc-donor-profile',
         ];
 
-        // Build JSON Patch ops for ALL target properties (clear with "")
         $ops = [];
         foreach ($slugMap as $concept => $slug) {
-            if (!in_array($slug, $existing, true)) continue; // safety
+            if (!in_array($slug, $existing, true)) continue;
+
             $val = $kv[$concept] ?? null;
 
-            // date formatting
-            if ($slug === 'last-donation-date') {
+            // format dates
+            if ($slug === 'last-donation-date' && $val !== null && $val !== '') {
                 $val = $this->dateOnly($val);
             }
 
-            // ALWAYS send a value ("" clears)
-            $ops[] = ['op' => 'replace', 'path' => '/'.$slug, 'value' => ($val === null ? '' : $val)];
+            if ($sparse) {
+                // Only send when we actually have a value from this event
+                if ($val === null || $val === '') continue;
+            } else {
+                // Non-sparse mode (not used right now): clear with ""
+                $val = $val ?? '';
+            }
+
+            $ops[] = ['op' => 'replace', 'path' => '/'.$slug, 'value' => $val];
+        }
+
+        if (!$ops) {
+            Log::info('HS client properties: nothing to patch (sparse)', ['customerId'=>$customerId]);
+            return;
         }
 
         $r2 = Http::withToken($token)->acceptJson()->asJson()->timeout(10)
@@ -468,12 +458,11 @@ class HelpScoutSync
             throw new SyncAbort('HS client properties failed: '.$r2->status().' '.substr($r2->body(), 250));
         }
 
-        Log::info('HS client props: PATCH OK', ['status' => $r2->status(), 'ops' => count($ops)]);
+        Log::info('HS client props: PATCH OK', ['status'=>$r2->status(),'ops'=>count($ops)]);
     }
 
-    /* ---------------------------------------------------------------------
-     | Utilities
-     * --------------------------------------------------------------------*/
+    /* ---------------- Utilities ---------------- */
+
     private function firstNonEmpty(array $paths, array $source): mixed
     {
         foreach ($paths as $p) {
@@ -509,18 +498,18 @@ class HelpScoutSync
 
     private function ordinal(int $n): string
     {
-        if (in_array($n % 100, [11, 12, 13], true)) return $n . 'th';
-        return $n . ([1 => 'st', 2 => 'nd', 3 => 'rd'][$n % 10] ?? 'th');
+        if (in_array($n % 100, [11,12,13], true)) return $n.'th';
+        return $n . ([1=>'st',2=>'nd',3=>'rd'][$n % 10] ?? 'th');
     }
 
     private function humanPeriod(string $raw): string
     {
         $raw = strtolower(trim($raw));
         return match ($raw) {
-            'month', 'monthly'                   => 'Monthly',
-            'year', 'yearly', 'annually'         => 'Yearly',
-            'week', 'weekly'                     => 'Weekly',
-            default                              => ucfirst($raw),
+            'month','monthly'             => 'Monthly',
+            'year','yearly','annually'    => 'Yearly',
+            'week','weekly'               => 'Weekly',
+            default                       => ucfirst($raw),
         };
     }
 
