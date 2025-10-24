@@ -88,7 +88,9 @@ class HelpScout
             'refresh_token' => $token,
             'saved_at'      => now()->toISOString(),
         ], JSON_PRETTY_PRINT));
+        \Illuminate\Support\Facades\Cache::forever('hs_refresh_file', $token);
     }
+
 
     /* =========================
      * Customers
@@ -106,7 +108,7 @@ class HelpScout
         Log::warning('HS search (email) failed', ['status' => $r->status()]);
 
         // Fallback DSL
-        $r2 = $http()->get("{$this->api}/customers", ['query' => '(email:"'.$email.'")', 'page' => 1]);
+        $r2 = $http()->get("{$this->api}/customers", ['query' => '(email:"' . $email . '")', 'page' => 1]);
         if ($r2->ok()) {
             return data_get($r2->json(), '_embedded.customers.0');
         }
@@ -179,11 +181,11 @@ class HelpScout
         $existing = $this->propertySlugs($token);
 
         // Warn once for important slugs
-        $must = ['last-donation-amount','payment-method','billing-address1','billing-city','billing-postal','recurring-summary','sponsorship-name','sponsorship-ref','sponsorship-url'];
+        $must = ['last-donation-amount', 'payment-method', 'billing-address1', 'billing-city', 'billing-postal', 'recurring-summary', 'sponsorship-name', 'sponsorship-ref', 'sponsorship-url'];
         $missing = array_values(array_diff($must, $existing));
         if ($missing) Log::warning('HS missing important custom properties (please create these slugs)', $missing);
 
-        $numeric = ['donor-id','lifetime-donation','phone-no'];
+        $numeric = ['donor-id', 'lifetime-donation', 'phone-no'];
         $ops = [];
 
         foreach ($kv as $concept => $val) {
@@ -191,16 +193,19 @@ class HelpScout
             $slug = $slugMap[$concept] ?? null;
             if (!$slug || !in_array($slug, $existing, true)) continue;
 
-            if (in_array($slug, ['last-order','donor-since'], true)) {
-                try { $val = Carbon::parse($val)->toDateString(); }
-                catch (\Throwable $e) { $val = substr((string)$val, 0, 10); }
+            if (in_array($slug, ['last-order', 'donor-since'], true)) {
+                try {
+                    $val = Carbon::parse($val)->toDateString();
+                } catch (\Throwable $e) {
+                    $val = substr((string)$val, 0, 10);
+                }
             }
             if (in_array($slug, $numeric, true)) {
                 if (!is_numeric($val)) continue;
                 $val += 0;
             }
 
-            $ops[] = ['op' => 'replace', 'path' => '/'.$slug, 'value' => $val];
+            $ops[] = ['op' => 'replace', 'path' => '/' . $slug, 'value' => $val];
         }
 
         if (!$ops) return;
@@ -209,7 +214,7 @@ class HelpScout
             ->acceptJson()->asJson()
             ->patch("{$this->api}/customers/{$customerId}/properties", $ops);
 
-        if (!in_array($r->status(), [200,204], true)) {
+        if (!in_array($r->status(), [200, 204], true)) {
             Log::warning('HS properties patch failed (non-fatal)', [
                 'status' => $r->status(),
                 'body'   => substr($r->body(), 0, 250),

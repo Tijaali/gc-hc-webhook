@@ -22,7 +22,11 @@ class HelpScoutSync
         $b = $this->normalize($event, $body);
 
         $email = $this->firstNonEmpty([
-            'email','supporter.email','billing_address.email','account.email','customer.email',
+            'email',
+            'supporter.email',
+            'billing_address.email',
+            'account.email',
+            'customer.email',
         ], $b);
         if (!$email) throw new SyncAbort('No donor email in payload');
 
@@ -31,8 +35,8 @@ class HelpScoutSync
         $cust = $this->hsFindCustomer($token, $email);
         $id   = $cust['id'] ?? 0;
         if (!$id) {
-            $first = $this->firstNonEmpty(['supporter.first_name','billing_address.first_name'], $b);
-            $last  = $this->firstNonEmpty(['supporter.last_name','billing_address.last_name'], $b);
+            $first = $this->firstNonEmpty(['supporter.first_name', 'billing_address.first_name'], $b);
+            $last  = $this->firstNonEmpty(['supporter.last_name', 'billing_address.last_name'], $b);
             $id    = $this->hsCreateCustomerStrict($token, $first, $last, $email);
         }
         if (!$id) throw new SyncAbort('Could not resolve or create HS customer');
@@ -42,7 +46,7 @@ class HelpScoutSync
         $props = $this->buildProperties($b);
         $this->hsPatchPropertiesStrict($token, $id, $props);
 
-        Log::info('HS_SYNC_OK', compact('event','delivery','email') + ['customerId'=>$id]);
+        Log::info('HS_SYNC_OK', compact('event', 'delivery', 'email') + ['customerId' => $id]);
     }
 
     /* ---------- Normalization across GC events ---------- */
@@ -70,7 +74,7 @@ class HelpScoutSync
             $acctType = data_get($rp, 'payment_method.account_type') ?: data_get($rp, 'payment_method.display_name');
             if ($acctType) {
                 $b['payments'][0]['type']           = 'card';
-                $b['payments'][0]['status']         = ($rp['status'] ?? '') === 'Active' ? 'succeeded' : (data_get($b,'payments.0.status') ?? null);
+                $b['payments'][0]['status']         = ($rp['status'] ?? '') === 'Active' ? 'succeeded' : (data_get($b, 'payments.0.status') ?? null);
                 $b['payments'][0]['card']['brand']  = $acctType;
             }
             if (!isset($b['currency'])) {
@@ -84,35 +88,35 @@ class HelpScoutSync
     /* ---------- Build ALL requested properties ---------- */
     private function buildProperties(array $b): array
     {
-        $donorId    = $this->firstNonEmpty(['supporter.id','supporter.id_deprecated','account.id','vendor_contact_id'], $b);
-        $orderedAt  = $this->firstNonEmpty(['ordered_at','created_at'], $b);
+        $donorId    = $this->firstNonEmpty(['supporter.id', 'supporter.id_deprecated', 'account.id', 'vendor_contact_id'], $b);
+        $orderedAt  = $this->firstNonEmpty(['ordered_at', 'created_at'], $b);
         $lastDate   = $this->dateOnly($orderedAt);
         $donorSince = $this->dateOnly($this->firstNonEmpty(['supporter.created_at'], $b));
 
-        $amount   = $this->firstNonEmpty(['total_amount','subtotal_amount','amount','line_items.0.recurring_amount'], $b);
-        $currency = $this->firstNonEmpty(['currency','payments.0.currency.code','line_items.0.recurring_profile.currency.code'], $b);
+        $amount   = $this->firstNonEmpty(['total_amount', 'subtotal_amount', 'amount', 'line_items.0.recurring_amount'], $b);
+        $currency = $this->firstNonEmpty(['currency', 'payments.0.currency.code', 'line_items.0.recurring_profile.currency.code'], $b);
         $lastDonationAmount = ($amount !== null && $currency)
             ? sprintf('%s %s', $this->money((float)$amount), $currency)
             : null;
 
-        $payBrand  = $this->firstNonEmpty(['payments.0.card.brand','payments.0.type','payment_type','line_items.0.recurring_profile.payment_method.account_type'], $b);
+        $payBrand  = $this->firstNonEmpty(['payments.0.card.brand', 'payments.0.type', 'payment_type', 'line_items.0.recurring_profile.payment_method.account_type'], $b);
         $isPaid    = $this->firstNonEmpty(['payments.0.status'], $b) === 'succeeded' || ($this->firstNonEmpty(['is_paid'], $b) === true);
         $payStatus = $isPaid ? 'paid' : null;
-        $txnType   = $this->firstNonEmpty(['payments.0.type','payment_type'], $b);
+        $txnType   = $this->firstNonEmpty(['payments.0.type', 'payment_type'], $b);
 
-        $rpStatus  = strtolower((string)($this->firstNonEmpty(['line_items.0.recurring_profile.status','recurring_profile.status'], $b) ?? ''));
+        $rpStatus  = strtolower((string)($this->firstNonEmpty(['line_items.0.recurring_profile.status', 'recurring_profile.status'], $b) ?? ''));
         $recStatus = $rpStatus ? ucfirst($rpStatus) : null; // Active / Paused / Canceled etc.
 
         $lifetime  = $this->firstNonEmpty(['supporter.lifetime_donation_amount'], $b);
 
-        $country = $this->firstNonEmpty(['billing_address.country_code','billing_address.country','supporter.billing_address.country'], $b);
-        $state   = $this->firstNonEmpty(['billing_address.province_code','billing_address.state','supporter.billing_address.state'], $b);
+        $country = $this->firstNonEmpty(['billing_address.country_code', 'billing_address.country', 'supporter.billing_address.country'], $b);
+        $state   = $this->firstNonEmpty(['billing_address.province_code', 'billing_address.state', 'supporter.billing_address.state'], $b);
         $addr1   = $this->firstNonEmpty(['billing_address.address1'], $b);
         $city    = $this->firstNonEmpty(['billing_address.city'], $b);
         $postal  = $this->firstNonEmpty(['billing_address.zip'], $b);
-        $phone   = $this->firstNonEmpty(['billing_address.phone','supporter.billing_address.phone'], $b);
+        $phone   = $this->firstNonEmpty(['billing_address.phone', 'supporter.billing_address.phone'], $b);
 
-        $profile = $this->firstNonEmpty(['supporter.profile_url','line_items.0.public_url'], $b);
+        $profile = $this->firstNonEmpty(['supporter.profile_url', 'line_items.0.public_url'], $b);
 
         $recurring = $this->buildRecurringSummary($b);
 
@@ -186,6 +190,19 @@ class HelpScoutSync
     {
         $token = Cache::remember('hs_access_token', now()->addMinutes(30), function () {
             $refresh = (string) (Cache::get('hs_refresh_file') ?? env('HS_REFRESH_TOKEN', ''));
+            if ($refresh === '') {
+                try {
+                    $path = 'hs_oauth.json';
+                    if (\Illuminate\Support\Facades\Storage::exists($path)) {
+                        $saved = json_decode(\Illuminate\Support\Facades\Storage::get($path), true);
+                        if (!empty($saved['refresh_token'])) {
+                            $refresh = (string) $saved['refresh_token'];
+                        }
+                    }
+                } catch (\Throwable $e) {
+                }
+            }
+
             if ($refresh === '') throw new SyncAbort('Missing HS_REFRESH_TOKEN');
 
             $resp = Http::asForm()->timeout(8)->post($this->hsTokenUrl, [
@@ -195,7 +212,7 @@ class HelpScoutSync
                 'client_secret' => env('HS_CLIENT_SECRET'),
             ]);
             if (!$resp->ok()) {
-                throw new SyncAbort('HS token refresh failed: '.$resp->status().' '.$resp->body());
+                throw new SyncAbort('HS token refresh failed: ' . $resp->status() . ' ' . $resp->body());
             }
             $data = $resp->json();
             if (!empty($data['refresh_token'])) {
@@ -211,7 +228,8 @@ class HelpScoutSync
     private function hsFindCustomer(string $token, string $email): ?array
     {
         $r1 = Http::withToken($token)->timeout(8)->get("{$this->hsApi}/customers", [
-            'email' => $email, 'page' => 1,
+            'email' => $email,
+            'page' => 1,
         ]);
         if ($r1->ok()) {
             $hit = data_get($r1->json(), '_embedded.customers.0');
@@ -226,7 +244,7 @@ class HelpScoutSync
             if (is_array($hit)) return $hit;
         }
 
-        Log::warning('HS find failed', ['email'=>$email, 's1'=>$r1->status(), 's2'=>$r2->status(), 'b2'=>$r2->body()]);
+        Log::warning('HS find failed', ['email' => $email, 's1' => $r1->status(), 's2' => $r2->status(), 'b2' => $r2->body()]);
         return null;
     }
 
@@ -250,22 +268,22 @@ class HelpScoutSync
 
         if ($r->successful()) return (int)($r->json('id') ?? 0);
 
-        throw new SyncAbort('HS create failed: '.$r->status().' '.$r->body());
+        throw new SyncAbort('HS create failed: ' . $r->status() . ' ' . $r->body());
     }
 
     private function hsUpdateCoreSoft(string $token, int $id, array $b): void
     {
-        $first = $this->firstNonEmpty(['supporter.first_name','billing_address.first_name'], $b);
-        $last  = $this->firstNonEmpty(['supporter.last_name','billing_address.last_name'], $b);
-        $email = $this->firstNonEmpty(['email','supporter.email','billing_address.email'], $b);
+        $first = $this->firstNonEmpty(['supporter.first_name', 'billing_address.first_name'], $b);
+        $last  = $this->firstNonEmpty(['supporter.last_name', 'billing_address.last_name'], $b);
+        $email = $this->firstNonEmpty(['email', 'supporter.email', 'billing_address.email'], $b);
 
         $addr1 = $this->firstNonEmpty(['billing_address.address1'], $b);
         $city  = $this->firstNonEmpty(['billing_address.city'], $b);
-        $state = $this->firstNonEmpty(['billing_address.province_code','billing_address.state'], $b);
+        $state = $this->firstNonEmpty(['billing_address.province_code', 'billing_address.state'], $b);
         $zip   = $this->firstNonEmpty(['billing_address.zip'], $b);
-        $ctry  = $this->firstNonEmpty(['billing_address.country_code','billing_address.country'], $b);
-        $phone = $this->firstNonEmpty(['billing_address.phone','supporter.billing_address.phone'], $b);
-        $site  = $this->firstNonEmpty(['supporter.profile_url','line_items.0.public_url'], $b);
+        $ctry  = $this->firstNonEmpty(['billing_address.country_code', 'billing_address.country'], $b);
+        $phone = $this->firstNonEmpty(['billing_address.phone', 'supporter.billing_address.phone'], $b);
+        $site  = $this->firstNonEmpty(['supporter.profile_url', 'line_items.0.public_url'], $b);
 
         $payload = array_filter([
             'firstName' => $first ?: null,
@@ -289,7 +307,7 @@ class HelpScoutSync
             ->put("{$this->hsApi}/customers/{$id}", $payload);
 
         if (!$r->successful()) {
-            Log::warning('HS core update failed (soft)', ['status'=>$r->status(),'body'=>$r->body(),'pay'=>$payload]);
+            Log::warning('HS core update failed (soft)', ['status' => $r->status(), 'body' => $r->body(), 'pay' => $payload]);
         }
     }
 
@@ -297,12 +315,12 @@ class HelpScoutSync
     {
         $prefill = trim((string) env('HS_KNOWN_SLUGS', ''));
         if ($prefill !== '') {
-            return collect(explode(',', $prefill))->map(fn($s)=>trim($s))->filter()->values()->all();
+            return collect(explode(',', $prefill))->map(fn($s) => trim($s))->filter()->values()->all();
         }
 
         $r = Http::withToken($token)->timeout(8)->get("{$this->hsApi}/customer-properties");
         if (!$r->ok()) {
-            throw new SyncAbort('HS properties list failed: '.$r->status().' '.$r->body());
+            throw new SyncAbort('HS properties list failed: ' . $r->status() . ' ' . $r->body());
         }
         return collect(data_get($r->json(), '_embedded.customer-properties', []))
             ->pluck('slug')->filter()->values()->all();
@@ -332,19 +350,19 @@ class HelpScoutSync
             'billing_city'         => 'billing-city',
             'billing_postal'       => 'billing-postal',
         ];
-        $numericSlugs   = ['donor-id','lifetime-donation']; // phone kept as text
+        $numericSlugs   = ['donor-id', 'lifetime-donation']; // phone kept as text
         $existing       = $this->hsPropertySlugs($token);
 
         // Required slugs (fatal if missing)
-        $required = collect(explode(',', (string)env('HS_REQUIRED_SLUGS','')))
-            ->map(fn($s)=>trim($s))->filter()->values()->all();
+        $required = collect(explode(',', (string)env('HS_REQUIRED_SLUGS', '')))
+            ->map(fn($s) => trim($s))->filter()->values()->all();
 
         $missingRequired = [];
         foreach ($required as $need) {
             if ($need !== '' && !in_array($need, $existing, true)) $missingRequired[] = $need;
         }
         if ($missingRequired) {
-            throw new SyncAbort('Missing required HS custom properties: '.implode(', ', $missingRequired));
+            throw new SyncAbort('Missing required HS custom properties: ' . implode(', ', $missingRequired));
         }
 
         $ops = [];
@@ -360,7 +378,7 @@ class HelpScoutSync
                 if (!is_numeric($val)) continue;
                 $val = $val + 0;
             }
-            if (in_array($slug, ['last-order','donor-since'], true)) {
+            if (in_array($slug, ['last-order', 'donor-since'], true)) {
                 $val = $this->dateOnly((string)$val);
                 if (!$val) continue;
             }
@@ -369,7 +387,7 @@ class HelpScoutSync
 
         if (!$ops) {
             // If we got here on a contribution/recurring event but nothing to set, treat as soft success.
-            Log::info('HS properties no-op', ['customerId'=>$customerId]);
+            Log::info('HS properties no-op', ['customerId' => $customerId]);
             return;
         }
 
@@ -378,7 +396,7 @@ class HelpScoutSync
             ->patch("{$this->hsApi}/customers/{$customerId}/properties", $payload);
 
         if (!$r->ok()) {
-            throw new SyncAbort('HS properties failed: '.$r->status().' '.$r->body());
+            throw new SyncAbort('HS properties failed: ' . $r->status() . ' ' . $r->body());
         }
     }
 
@@ -397,7 +415,7 @@ class HelpScoutSync
         if (!$raw) return null;
         $d = preg_replace('/\D+/', '', $raw);
         return $d !== '' ? $d : null;
-        }
+    }
 
     private function extractDayNumber($raw): ?int
     {
@@ -410,8 +428,11 @@ class HelpScoutSync
     private function dateOnly(?string $raw): ?string
     {
         if ($raw === null || $raw === '') return null;
-        try { return Carbon::parse($raw)->toDateString(); }
-        catch (\Throwable $e) { return substr((string)$raw, 0, 10); }
+        try {
+            return Carbon::parse($raw)->toDateString();
+        } catch (\Throwable $e) {
+            return substr((string)$raw, 0, 10);
+        }
     }
 
     private function money(float $n): string
@@ -422,7 +443,7 @@ class HelpScoutSync
 
     private function ordinal(int $n): string
     {
-        if (in_array($n % 100, [11,12,13], true)) return $n.'th';
-        return $n . ([1=>'st',2=>'nd',3=>'rd'][$n%10] ?? 'th');
+        if (in_array($n % 100, [11, 12, 13], true)) return $n . 'th';
+        return $n . ([1 => 'st', 2 => 'nd', 3 => 'rd'][$n % 10] ?? 'th');
     }
 }
