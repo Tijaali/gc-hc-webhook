@@ -230,8 +230,6 @@ class HelpScoutSync
         return $brand ?: null;
     }
 
-    /* --------------- Help Scout API --------------- */
-
     private function hsAccessTokenStrict(): string
     {
         if ($cached = Cache::get('hs_access_token')) {
@@ -370,11 +368,6 @@ class HelpScoutSync
         throw new SyncAbort('HS create failed: '.$r->status().' '.$r->body());
     }
 
-    /**
-     * Upserts only the client properties.
-     * If $sparse = true, we ONLY send fields that have non-empty values.
-     * (Prevents wiping donation data when supporter_updated lacks those fields.)
-     */
     private function hsPatchClientPropertiesStrict(string $token, int $customerId, array $kv, bool $sparse = true): void
     {
         $need = [
@@ -384,7 +377,6 @@ class HelpScoutSync
             'last-donation-date'              => ['Last Donation Date',               'date'],
             'recurring-details'               => ['Recurring Details',                'text'],
             'helpful-for-sponsorship-tickets' => ['Helpful for sponsorship tickets',  'text'],
-            'sponsorship-info'                => ['Sponsorship Info',                 'text'],
             'location'                        => ['Location',                         'text'],
             'payment-method'                  => ['Payment Method',                   'text'],
             'phone-no'                        => ['Phone No',                         'text'],
@@ -416,7 +408,6 @@ class HelpScoutSync
             'last_date'      => 'last-donation-date',
             'recur'          => 'recurring-details',
             'sponsor_help'   => 'helpful-for-sponsorship-tickets',
-            'sponsor_info'   => 'sponsorship-info',
             'location'       => 'location',
             'pay_method'     => 'payment-method',
             'phone'          => 'phone-no',
@@ -436,10 +427,8 @@ class HelpScoutSync
             }
 
             if ($sparse) {
-                // Only send when we actually have a value from this event
                 if ($val === null || $val === '') continue;
             } else {
-                // Non-sparse mode (not used right now): clear with ""
                 $val = $val ?? '';
             }
 
