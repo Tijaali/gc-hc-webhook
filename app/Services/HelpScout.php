@@ -115,10 +115,10 @@ class HelpScout
         Log::warning('HS search (email) failed', ['status' => $r->status()]);
 
         // Fallback DSL
-        $r2 = $http()->get("{$this->api}/search/customers", [
+        $r2 = $http()->get("{$this->api}/customers", [
             'query' => '(email:"' . $email . '")',
             'page'  => 1,
-        ]); // ✅ correct path for search DSL
+        ]);
 
         if ($r2->ok()) {
             return data_get($r2->json(), '_embedded.customers.0');
@@ -216,7 +216,7 @@ class HelpScout
 
         if (!$ops) return;
 
-        $payload = ['operations' => $ops]; // ✅ wrap in "operations"
+        $payload = $ops;
 
         $r = \Illuminate\Support\Facades\Http::withToken($token)
             ->connectTimeout(2)->timeout(8)

@@ -298,7 +298,8 @@ class HelpScoutSync
         }
 
         $q  = '(email:"' . addslashes($email) . '")';
-        $r2 = Http::withToken($token)->timeout(8)->get("{$this->hsApi}/search/customers", ['query' => $q]);
+        $r2 = Http::withToken($token)->timeout(8)
+            ->get("{$this->hsApi}/customers", ['query' => $q, 'page' => 1]);
         if ($r2->ok()) {
             $hit = data_get($r2->json(), '_embedded.results.0.customer')
                 ?: data_get($r2->json(), '_embedded.results.0');
@@ -452,7 +453,7 @@ class HelpScoutSync
             return;
         }
 
-        $payload = ['operations' => $ops];
+        $payload = $ops; // send the array itself
         $r = Http::withToken($token)->acceptJson()->asJson()->timeout(10)
             ->patch("{$this->hsApi}/customers/{$customerId}/properties", $payload);
 
