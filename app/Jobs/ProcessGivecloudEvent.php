@@ -4,21 +4,23 @@ namespace App\Jobs;
 
 use Carbon\Carbon;
 use Illuminate\Bus\Queueable;
-use Illuminate\Contracts\Queue\ShouldQueue;
+use Illuminate\Contracts\Queue\ShouldQueue; // fine to keep, we call handle() inline
+use Illuminate\Foundation\Bus\Dispatchable;
 use Illuminate\Queue\InteractsWithQueue;
-use Illuminate\Queue\Middleware\WithoutOverlapping;
 use Illuminate\Queue\SerializesModels;
 use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\Http;
 use Illuminate\Support\Facades\Log;
-use Illuminate\Foundation\Bus\Dispatchable;
 
 class ProcessGivecloudEvent implements ShouldQueue
 {
-    use Dispatchable, InteractsWithQueue, Queueable, SerializesModels;
+    use Dispatchable, Queueable, InteractsWithQueue, SerializesModels;
 
-    public int $tries = 3;
-    public int $timeout = 20; // seconds
+    public int $tries = 2;
+    public int $timeout = 20;
+
+    private string $hsTokenUrl = 'https://api.helpscout.net/v2/oauth2/token';
+    private string $hsApi      = 'https://api.helpscout.net/v2';
 
     public function __construct(
         public string $event,
@@ -27,158 +29,105 @@ class ProcessGivecloudEvent implements ShouldQueue
         public array $payload
     ) {}
 
-    public function middleware()
-    {
-        // Extra safety (per-job lock). Keyed by delivery.
-        return [ new WithoutOverlapping("gc-lock:{$this->delivery}") ];
-    }
-
     public function handle(): void
     {
+        // Ensure we never re-run the same delivery
         $lockKey = "gc:executed:{$this->delivery}";
         if (!Cache::add($lockKey, 1, now()->addMinutes(10))) {
-            // Another path already finished this delivery
             return;
         }
 
         $b = $this->payload;
-        $email = $this->extractEmail($b);
+
+        // --- email required for HS upsert ---
+        $email = $this->firstNonEmpty([
+            'email',
+            'supporter.email',
+            'billing_address.email',
+            'account.email',
+            'customer.email',
+        ], $b);
         if (!$email) {
             Log::warning('GC: no email in payload', ['event' => $this->event, 'delivery' => $this->delivery]);
             return;
         }
 
+        // Token
         $token = $this->hsAccessToken();
 
-        // 1) Find or create customer in Help Scout
+        // Find or create customer
         $customer = $this->hsFindCustomer($token, $email);
         $id = $customer['id'] ?? 0;
 
-        // Create if needed (handle 409 gracefully)
         if (!$id) {
-            $first = $this->val($b, ['supporter.first_name','billing_address.first_name']);
-            $last  = $this->val($b, ['supporter.last_name','billing_address.last_name']);
-            $id = $this->hsCreateCustomer($token, $first, $last, $email);
+            $first = $this->firstNonEmpty(['supporter.first_name','billing_address.first_name'], $b);
+            $last  = $this->firstNonEmpty(['supporter.last_name', 'billing_address.last_name'], $b);
+            $id    = $this->hsCreateCustomer($token, $first, $last, $email);
         }
         if (!$id) {
             Log::error('GC: unable to resolve HS customer id', ['email' => $email, 'event' => $this->event]);
             return;
         }
 
-        // 2) Build desired properties
-        $props = $this->buildProperties($b);
+        // --- core fields (name, emails, phones, addresses) ---
+        $this->hsUpdateCore($token, $id, $b);
 
-        // 3) Patch custom properties (only slugs that actually exist)
+        // --- custom properties ---
+        $props = $this->buildProperties($b);
         $this->hsPatchProperties($token, $id, $props);
 
-        // 4) Done
-        Log::info('HS_SYNC_OK', ['delivery' => $this->delivery, 'event' => $this->event, 'email' => $email, 'customerId' => $id]);
-    }
-
-    /* =========================
-     *   Extractors
-     * ========================= */
-
-    private function extractEmail(array $b): ?string
-    {
-        return $this->val($b, [
-            'email',
-            'supporter.email',
-            'billing_address.email',
-            'account.email',
-            'customer.email'
+        Log::info('HS_SYNC_OK', [
+            'delivery'   => $this->delivery,
+            'event'      => $this->event,
+            'email'      => $email,
+            'customerId' => $id
         ]);
     }
 
-    private function val(array $a, array $paths, $default = null)
-    {
-        foreach ($paths as $p) {
-            $v = data_get($a, $p);
-            if ($v !== null && $v !== '') return $v;
-        }
-        return $default;
-    }
-
-    private function parseDate(?string $raw): ?string
-    {
-        if (!$raw) return null;
-        try { return Carbon::parse($raw)->toDateString(); }
-        catch (\Throwable $e) { return substr((string)$raw, 0, 10); }
-    }
-
-    private function digits(?string $raw): ?int
-    {
-        if (!$raw) return null;
-        $d = preg_replace('/\D+/', '', $raw);
-        return $d !== '' ? (int)$d : null;
-    }
-
-    private function buildRecurringSummary(array $b): ?string
-    {
-        $li = data_get($b, 'line_items.0'); // first item
-        if (!$li) return null;
-
-        $amt = data_get($li, 'recurring_amount') ?? data_get($li, 'price') ?? null;
-        $period = data_get($li, 'recurring_profile.billing_period_description') // "Monthly"
-               ?? data_get($li, 'variant.billing_period')
-               ?? null;
-        $day = data_get($li, 'recurring_day'); // 1..31
-        if ($amt === null || !$period || !$day) return null;
-
-        // Render like "$250 / Monthly / 23rd"
-        $daySuffix = $this->ordinal((int)$day);
-        return sprintf('$%s / %s / %s', rtrim(rtrim(number_format((float)$amt, 2, '.', ''), '0'), '.'), $period, $daySuffix);
-    }
-
-    private function ordinal(int $n): string
-    {
-        if (in_array($n % 100, [11,12,13], true)) return $n.'th';
-        return $n . ([1=>'st',2=>'nd',3=>'rd'][$n%10] ?? 'th');
-    }
-
-    private function buildSponsorship(array $b): array
-    {
-        $li = data_get($b, 'line_items.0');
-        return [
-            'sponsorship_name' => data_get($li, 'sponsee.full_name') ?: null,
-            'sponsorship_ref'  => data_get($li, 'reference') ?: null,
-            'sponsorship_url'  => data_get($li, 'public_url') ?: null,
-        ];
-    }
+    /* =========================
+     *  Build properties (all required by you)
+     * ========================= */
 
     private function buildProperties(array $b): array
     {
-        // Basics
-        $donorId   = $this->val($b, ['supporter.id', 'supporter.id_deprecated', 'account.id', 'vendor_contact_id']);
-        $country   = $this->val($b, ['billing_address.country_code','billing_address.country','supporter.billing_address.country']);
-        $state     = $this->val($b, ['billing_address.province_code','billing_address.state','supporter.billing_address.state']);
-        $addr1     = $this->val($b, ['billing_address.address1']);
-        $city      = $this->val($b, ['billing_address.city']);
-        $postal    = $this->val($b, ['billing_address.zip']);
-        $phone     = $this->digits($this->val($b, ['billing_address.phone','supporter.billing_address.phone']));
-        $profile   = $this->val($b, ['supporter.profile_url', 'line_items.0.public_url']);
-        $orderedAt = $this->val($b, ['ordered_at','created_at']);
-        $lastDate  = $this->parseDate($orderedAt);
+        // donor id
+        $donorId = $this->firstNonEmpty(['supporter.id', 'supporter.id_deprecated', 'account.id', 'vendor_contact_id'], $b);
 
-        // Amount & currency (last donation)
-        $amount   = $this->val($b, ['total_amount','subtotal_amount','amount']);
-        $currency = $this->val($b, ['currency','payments.0.currency.code']);
-        $lastDonationAmount = ($amount !== null && $currency) ? sprintf('%s %s', rtrim(rtrim(number_format((float)$amount, 2, '.', ''), '0'), '.'), $currency) : null;
+        // location + address
+        $country = $this->firstNonEmpty(['billing_address.country_code','billing_address.country','supporter.billing_address.country'], $b);
+        $state   = $this->firstNonEmpty(['billing_address.province_code','billing_address.state','supporter.billing_address.state'], $b);
+        $addr1   = $this->firstNonEmpty(['billing_address.address1'], $b);
+        $city    = $this->firstNonEmpty(['billing_address.city'], $b);
+        $postal  = $this->firstNonEmpty(['billing_address.zip'], $b);
+        $phone   = $this->digits($this->firstNonEmpty(['billing_address.phone','supporter.billing_address.phone'], $b));
 
-        // Payment details
-        $payBrand = $this->val($b, ['payments.0.card.brand','payments.0.type','payment_type']);
-        $payStatus= ($this->val($b, ['payments.0.status']) === 'succeeded' || $this->val($b, ['is_paid']) === true) ? 'paid' : null;
+        // profile URL
+        $profile = $this->firstNonEmpty(['supporter.profile_url', 'line_items.0.public_url'], $b);
 
-        // Lifetime (only present on supporter payloads)
-        $lifetime = $this->val($b, ['supporter.lifetime_donation_amount']);
+        // dates
+        $orderedAt = $this->firstNonEmpty(['ordered_at','created_at'], $b);
+        $lastDate  = $this->dateOnly($orderedAt);
+        $donorSince = $this->dateOnly($this->firstNonEmpty(['supporter.created_at'], $b));
 
-        // Donor since
-        $donorSince = $this->parseDate($this->val($b, ['supporter.created_at']));
+        // amount + currency
+        $amount   = $this->firstNonEmpty(['total_amount','subtotal_amount','amount'], $b);
+        $currency = $this->firstNonEmpty(['currency','payments.0.currency.code'], $b);
+        $lastDonationAmount = ($amount !== null && $currency)
+            ? sprintf('%s %s', $this->money((float)$amount), $currency)
+            : null;
 
-        // Recurring summary
+        // payment
+        $payBrand  = $this->firstNonEmpty(['payments.0.card.brand','payments.0.type','payment_type'], $b);
+        $isPaid    = $this->firstNonEmpty(['payments.0.status'], $b) === 'succeeded' || ($this->firstNonEmpty(['is_paid'], $b) === true);
+        $payStatus = $isPaid ? 'paid' : null;
+
+        // lifetime
+        $lifetime = $this->firstNonEmpty(['supporter.lifetime_donation_amount'], $b);
+
+        // recurring summary
         $recurring = $this->buildRecurringSummary($b);
 
-        // Sponsorship
+        // sponsorship
         $sp = $this->buildSponsorship($b);
 
         return array_filter([
@@ -186,8 +135,8 @@ class ProcessGivecloudEvent implements ShouldQueue
             'donor_since'          => $donorSince,
             'last_donation_date'   => $lastDate,
             'last_donation_amount' => $lastDonationAmount,
-            'payment_method'       => $payBrand,
             'payment_status'       => $payStatus,
+            'payment_method'       => $payBrand,
             'recurring_summary'    => $recurring,
             'lifetime_donation'    => is_numeric($lifetime) ? (float)$lifetime : null,
             'donor_profile_url'    => $profile,
@@ -197,18 +146,39 @@ class ProcessGivecloudEvent implements ShouldQueue
             'billing_address1'     => $addr1,
             'billing_city'         => $city,
             'billing_postal'       => $postal,
-            'sponsorship_name'     => $sp['sponsorship_name'] ?? null,
-            'sponsorship_ref'      => $sp['sponsorship_ref'] ?? null,
-            'sponsorship_url'      => $sp['sponsorship_url'] ?? null,
+            'sponsorship_name'     => $sp['name'] ?? null,
+            'sponsorship_ref'      => $sp['ref'] ?? null,
+            'sponsorship_url'      => $sp['url'] ?? null,
         ], fn($v) => $v !== null && $v !== '');
     }
 
-    /* =========================
-     *   Help Scout API
-     * ========================= */
+    private function buildRecurringSummary(array $b): ?string
+    {
+        $li = data_get($b, 'line_items.0');
+        if (!$li) return null;
 
-    private string $hsTokenUrl = 'https://api.helpscout.net/v2/oauth2/token';
-    private string $hsApi      = 'https://api.helpscout.net/v2';
+        $amt    = data_get($li, 'recurring_amount') ?? data_get($li, 'price');
+        $period = data_get($li, 'recurring_profile.billing_period_description') ?? data_get($li, 'variant.billing_period');
+        $day    = data_get($li, 'recurring_day');
+
+        if ($amt === null || !$period || !$day) return null;
+
+        return sprintf('$%s / %s / %s', $this->money((float)$amt), $period, $this->ordinal((int)$day));
+    }
+
+    private function buildSponsorship(array $b): array
+    {
+        $li = data_get($b, 'line_items.0');
+        return [
+            'name' => data_get($li, 'sponsee.full_name') ?: null,
+            'ref'  => data_get($li, 'reference') ?: null,
+            'url'  => data_get($li, 'public_url') ?: null,
+        ];
+    }
+
+    /* =========================
+     *  Help Scout API helpers
+     * ========================= */
 
     private function hsAccessToken(): string
     {
@@ -217,8 +187,7 @@ class ProcessGivecloudEvent implements ShouldQueue
             if ($saved = Cache::get('hs_refresh_file')) {
                 $refresh = $saved;
             }
-
-            abort_unless($refresh !== '', 500, 'No Help Scout refresh token. Connect OAuth first.');
+            abort_unless($refresh !== '', 500, 'No Help Scout refresh token.');
 
             $resp = Http::asForm()->timeout(8)->post($this->hsTokenUrl, [
                 'grant_type'    => 'refresh_token',
@@ -226,42 +195,40 @@ class ProcessGivecloudEvent implements ShouldQueue
                 'client_id'     => env('HS_CLIENT_ID'),
                 'client_secret' => env('HS_CLIENT_SECRET'),
             ]);
-
             if (!$resp->ok()) {
                 throw new \RuntimeException('HS refresh failed: '.$resp->body());
             }
-
             $data = $resp->json();
             if (!empty($data['refresh_token'])) {
                 Cache::forever('hs_refresh_file', (string)$data['refresh_token']);
             }
-
             return (string) $data['access_token'];
         });
     }
 
     private function hsFindCustomer(string $token, string $email): ?array
     {
-        // Primary: direct query param (fast, plan-agnostic)
+        // Primary: direct filter (fast, plan-agnostic)
         $r = Http::withToken($token)->timeout(6)->get("{$this->hsApi}/customers", [
             'email' => $email,
             'page'  => 1,
         ]);
         if ($r->ok()) {
-            return data_get($r->json(), '_embedded.customers.0');
+            $hit = data_get($r->json(), '_embedded.customers.0');
+            if ($hit) return $hit;
         }
 
-        // Fallback: DSL (some accounts)
+        // Fallback: HS DSL (if enabled)
         $r2 = Http::withToken($token)->timeout(6)->get("{$this->hsApi}/customers", [
             'query' => '(email:"'.$email.'")',
             'page'  => 1,
         ]);
         if ($r2->ok()) {
-            return data_get($r2->json(), '_embedded.customers.0');
+            $hit = data_get($r2->json(), '_embedded.customers.0');
+            if ($hit) return $hit;
         }
 
-        // We intentionally skip /search/customers due to 404 on some plans
-        Log::warning('HS find failed (both strategies)', ['email' => $email, 's1' => $r->status(), 's2' => $r2->status()]);
+        Log::warning('HS find failed', ['email' => $email, 's1' => $r->status(), 's2' => $r2->status()]);
         return null;
     }
 
@@ -278,7 +245,7 @@ class ProcessGivecloudEvent implements ShouldQueue
             ->post("{$this->hsApi}/customers", $payload);
 
         if ($r->status() === 409) {
-            // Conflict: already exists -> fetch
+            // Already exists → fetch it
             $existing = $this->hsFindCustomer($token, $email);
             if ($existing && isset($existing['id'])) {
                 return (int) $existing['id'];
@@ -293,9 +260,49 @@ class ProcessGivecloudEvent implements ShouldQueue
         return 0;
     }
 
+    private function hsUpdateCore(string $token, int $id, array $b): void
+    {
+        $first = $this->firstNonEmpty(['supporter.first_name','billing_address.first_name'], $b);
+        $last  = $this->firstNonEmpty(['supporter.last_name','billing_address.last_name'], $b);
+        $email = $this->firstNonEmpty(['email','supporter.email','billing_address.email'], $b);
+
+        $addr1 = $this->firstNonEmpty(['billing_address.address1'], $b);
+        $city  = $this->firstNonEmpty(['billing_address.city'], $b);
+        $state = $this->firstNonEmpty(['billing_address.province_code','billing_address.state'], $b);
+        $zip   = $this->firstNonEmpty(['billing_address.zip'], $b);
+        $ctry  = $this->firstNonEmpty(['billing_address.country_code','billing_address.country'], $b);
+        $phone = $this->digits($this->firstNonEmpty(['billing_address.phone','supporter.billing_address.phone'], $b));
+        $site  = $this->firstNonEmpty(['supporter.profile_url','line_items.0.public_url'], $b);
+
+        $payload = array_filter([
+            'firstName' => $first ?: null,
+            'lastName'  => $last ?: null,
+            'emails'    => $email ? [['type' => 'work', 'value' => $email]] : null,
+            'websites'  => $site ? [['value' => $site]] : null,
+            'phones'    => $phone ? [['type' => 'work', 'value' => (string)$phone]] : null,
+            'addresses' => ($addr1 || $city || $state || $zip || $ctry) ? [[
+                'type'       => 'work',
+                'lines'      => array_values(array_filter([$addr1])),
+                'city'       => $city ?: null,
+                'state'      => $state ?: null,
+                'postalCode' => $zip ?: null,
+                'country'    => $ctry ?: null,
+            ]] : null,
+        ], fn($v) => $v !== null);
+
+        if (!$payload) return;
+
+        $r = Http::withToken($token)->acceptJson()->asJson()->timeout(8)
+            ->put("{$this->hsApi}/customers/{$id}", $payload);
+
+        if (!$r->successful()) {
+            Log::warning('HS core update failed (non-fatal)', ['status' => $r->status(), 'body' => $r->body(), 'pay' => $payload]);
+        }
+    }
+
     private function hsPropertySlugs(string $token): array
     {
-        // Allow pre-seeding via env to avoid an extra GET
+        // Optional prefill (comma-separated) to skip API hit
         $prefill = (string) env('HS_KNOWN_SLUGS', '');
         if ($prefill !== '') {
             return collect(explode(',', $prefill))->map(fn($s)=>trim($s))->filter()->values()->all();
@@ -314,42 +321,54 @@ class ProcessGivecloudEvent implements ShouldQueue
 
     private function hsPatchProperties(string $token, int $customerId, array $kv): void
     {
-        // Concept -> HS slugs (configure these in Help Scout once)
+        // Concept → HS slugs (create these custom properties once in HS admin)
         $slugMap = [
+            // Identity & donation meta
             'donor_id'             => 'donor-id',
-            'donor_since'          => 'donor-since',
-            'last_donation_date'   => 'last-order',
-            'last_donation_amount' => 'last-donation-amount',
-            'payment_status'       => 'payment-status',
-            'payment_method'       => 'payment-method',
-            'recurring_summary'    => 'recurring-summary',
-            'lifetime_donation'    => 'lifetime-donation',
-            'donor_profile_url'    => 'gc-donor-profile',
-            'country'              => 'country',
-            'province'             => 'state',
-            'phone'                => 'phone-no',
-            'billing_address1'     => 'billing-address1',
-            'billing_city'         => 'billing-city',
-            'billing_postal'       => 'billing-postal',
-            'sponsorship_name'     => 'sponsorship-name',
-            'sponsorship_ref'      => 'sponsorship-ref',
-            'sponsorship_url'      => 'sponsorship-url',
+            'donor_since'          => 'donor-since',           // date
+            'lifetime_donation'    => 'lifetime-donation',     // number
+            'donor_profile_url'    => 'gc-donor-profile',      // url/text
+
+            // Last donation info
+            'last_donation_date'   => 'last-order',            // date
+            'last_donation_amount' => 'last-donation-amount',  // text
+
+            // Payment
+            'payment_status'       => 'payment-status',        // text
+            'payment_method'       => 'payment-method',        // text
+
+            // Recurring & sponsorship
+            'recurring_summary'    => 'recurring-summary',     // text ($35 / Monthly / 1st)
+            'sponsorship_name'     => 'sponsorship-name',      // text
+            'sponsorship_ref'      => 'sponsorship-ref',       // text
+            'sponsorship_url'      => 'sponsorship-url',       // url/text
+
+            // Location & contact
+            'country'              => 'country',               // text
+            'province'             => 'state',                 // text
+            'phone'                => 'phone-no',              // number
+            'billing_address1'     => 'billing-address1',      // text
+            'billing_city'         => 'billing-city',          // text
+            'billing_postal'       => 'billing-postal',        // text
         ];
 
         $numericSlugs = ['donor-id','lifetime-donation','phone-no'];
-        $existing = $this->hsPropertySlugs($token);
+        $existing     = $this->hsPropertySlugs($token);
 
-        // Warn once if any important slug is missing
-        $mustHave = ['donor-id','last-order','country','state','last-donation-amount','payment-method',
-                     'recurring-summary','billing-address1','billing-city','billing-postal'];
-        $missing = array_values(array_diff($mustHave, $existing));
+        // Soft warn once per request if some slugs don’t exist
+        $missing = [];
+        foreach ($kv as $concept => $_) {
+            $slug = $slugMap[$concept] ?? null;
+            if ($slug && !in_array($slug, $existing, true)) $missing[] = $slug;
+        }
         if ($missing) {
-            Log::warning('HS missing important custom properties (please create these slugs)', $missing);
+            Log::warning('HS missing custom properties (create these slugs)', array_values(array_unique($missing)));
         }
 
         $ops = [];
         foreach ($kv as $concept => $val) {
             if ($val === null || $val === '') continue;
+
             $slug = $slugMap[$concept] ?? null;
             if (!$slug) continue;
             if (!in_array($slug, $existing, true)) continue;
@@ -358,8 +377,9 @@ class ProcessGivecloudEvent implements ShouldQueue
                 if (!is_numeric($val)) continue;
                 $val = $val + 0;
             }
-            if ($slug === 'last-order' || $slug === 'donor-since') {
-                $val = $this->parseDate((string)$val);
+
+            if (in_array($slug, ['last-order','donor-since'], true)) {
+                $val = $this->dateOnly((string)$val);
             }
 
             $ops[] = ['op' => 'replace', 'path' => '/'.$slug, 'value' => $val];
@@ -372,7 +392,45 @@ class ProcessGivecloudEvent implements ShouldQueue
 
         if (!in_array($r->status(), [200, 204], true)) {
             Log::error('HS properties failed', ['status' => $r->status(), 'body' => $r->body(), 'ops' => $ops]);
-            // Don’t throw – we don’t want the job to keep retrying if account lacks the feature
         }
+    }
+
+    /* =========================
+     *  Small utils
+     * ========================= */
+
+    private function firstNonEmpty(array $paths, array $source): mixed
+    {
+        foreach ($paths as $p) {
+            $v = data_get($source, $p);
+            if ($v !== null && $v !== '') return $v;
+        }
+        return null;
+    }
+
+    private function digits(?string $raw): ?int
+    {
+        if (!$raw) return null;
+        $d = preg_replace('/\D+/', '', $raw);
+        return $d !== '' ? (int)$d : null;
+        }
+
+    private function dateOnly(?string $raw): ?string
+    {
+        if (!$raw) return null;
+        try { return Carbon::parse($raw)->toDateString(); }
+        catch (\Throwable $e) { return substr((string)$raw, 0, 10); }
+    }
+
+    private function money(float $n): string
+    {
+        $s = number_format($n, 2, '.', '');
+        return rtrim(rtrim($s, '0'), '.');
+    }
+
+    private function ordinal(int $n): string
+    {
+        if (in_array($n % 100, [11,12,13], true)) return $n.'th';
+        return $n . ([1=>'st',2=>'nd',3=>'rd'][$n%10] ?? 'th');
     }
 }

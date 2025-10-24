@@ -40,16 +40,17 @@ class WebhookController extends Controller
      * Givecloud Webhook
      * ========================= */
 
-    public function gc(Request $r)
+   public function gc(Request $r)
     {
         $this->verifyGivecloud($r);
 
-        // Idempotency
+        // Idempotency by Givecloud delivery id (or hash of body)
         $delivery = (string) ($r->header('X-Givecloud-Delivery') ?? '');
         if ($delivery === '') {
             $delivery = sha1($r->getContent());
         }
         if (!Cache::add("gc:seen:$delivery", 1, now()->addMinutes(10))) {
+            // Already processed
             return response()->noContent(202);
         }
 
@@ -57,20 +58,29 @@ class WebhookController extends Controller
         $domain  = (string) ($r->header('X-Givecloud-Domain') ?? '');
         $payload = $r->json()->all();
 
-        // Queue (if worker available)
-        ProcessGivecloudEvent::dispatch($event, $delivery, $domain, $payload)->onQueue('hs');
-
-        // After-response fallback:
-        if (method_exists(ProcessGivecloudEvent::class, 'dispatchAfterResponse')) {
-            ProcessGivecloudEvent::dispatchAfterResponse($event, $delivery, $domain, $payload);
-        } else {
-            // Laravel < 8.57 fallback
-            app()->terminating(function () use ($event, $delivery, $domain, $payload) {
-                dispatch((new ProcessGivecloudEvent($event, $delivery, $domain, $payload))->onQueue('hs'));
-            });
+        // --- Respond fast ---
+        // Send 202 immediately to Givecloud
+        $resp = response()->noContent(202);
+        $resp->send();
+        if (function_exists('fastcgi_finish_request')) {
+            // Let the web server finish the HTTP response,
+            // then keep running PHP for the HS sync.
+            fastcgi_finish_request();
         }
 
-        return response()->noContent(202);
+        // --- Process inline (no queue worker required) ---
+        try {
+            (new ProcessGivecloudEvent($event, $delivery, $domain, $payload))->handle();
+        } catch (\Throwable $e) {
+            Log::error('GC inline handler error', [
+                'event' => $event,
+                'delivery' => $delivery,
+                'err' => $e->getMessage(),
+                'line' => $e->getLine(),
+                'file' => $e->getFile(),
+            ]);
+        }
+        return;
     }
 
     private function verifyGivecloud(Request $r): void

@@ -17,4 +17,4 @@ Route::get('/debug/env', fn() => [
 Route::get('/oauth/hs/start', [WebhookController::class, 'hsStart']);
 Route::get('/oauth/hs/callback', [WebhookController::class, 'hsCallback']);
 
-Route::post('/webhooks/givecloud', [WebhookController::class, 'gc'])->withoutMiddleware([FrameworkCsrf::class]);
+Route::post('/webhooks/givecloud', [WebhookController::class, 'gc'])->withoutMiddleware([FrameworkCsrf::class])->middleware(['throttle:240,1']);
