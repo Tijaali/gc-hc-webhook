@@ -86,7 +86,7 @@ class HelpScoutSync
         ], $b);
         $donorId = is_string($donorId) || is_numeric($donorId) ? (string)$donorId : null;
 
-       $donorSince = $this->resolveDonorSince($b);
+        $donorSince = $this->resolveDonorSince($b);
 
         $gcProfile = $this->firstNonEmpty([
             'supporter.profile_url',
@@ -416,50 +416,132 @@ class HelpScoutSync
         if (!$dates) return null;
 
         sort($dates);
-        return $dates[0]; 
+        return $dates[0];
     }
+    // private function hsPatchClientPropertiesStrict(string $token, int $customerId, array $kv): void
+    // {
+    //     $requiredSlugs = [
+    //         'donor-id',
+    //         'donor-since',
+    //         'gc-donor-profile',
+    //         'location',
+    //         'payment-method',
+    //         'recurring-details',
+    //         'helpful-for-sponsorship-tickets',
+    //     ];
+    //     $r = Http::withToken($token)->timeout(8)->get("{$this->hsApi}/customer-properties");
+    //     if (!$r->ok()) throw new SyncAbort('HS properties list failed: ' . $r->status() . ' ' . $r->body());
+
+    //     $existing = collect(data_get($r->json(), '_embedded.customer-properties', []))
+    //         ->pluck('slug')->filter()->values()->all();
+
+    //     $missing = array_values(array_diff($requiredSlugs, $existing));
+    //     if ($missing) {
+    //         throw new SyncAbort('Missing required Help Scout custom properties: ' . implode(', ', $missing));
+    //     }
+    //     $ops = [];
+    //     foreach ($requiredSlugs as $slug) {
+    //         $val = $kv[$slug] ?? null;
+    //         if (in_array($slug, ['donor-since'], true) && $val) {
+    //             $val = $this->dateOnly((string)$val);
+    //         }
+    //         $ops[] = ['op' => 'replace', 'path' => '/' . $slug, 'value' => $val];
+    //     }
+
+    //     $r2 = Http::withToken($token)->acceptJson()->asJson()->timeout(10)
+    //         ->patch("{$this->hsApi}/customers/{$customerId}/properties", $ops);
+
+    //     if (!in_array($r2->status(), [200, 204], true)) {
+    //         throw new SyncAbort('HS client properties failed: ' . $r2->status() . ' ' . substr($r2->body(), 0, 250));
+    //     }
+
+    //     Log::info('HS client props: PATCH OK (7 fields, no auto-create)', [
+    //         'customerId' => $customerId,
+    //         'ops'        => count($ops),
+    //     ]);
+    // }
     private function hsPatchClientPropertiesStrict(string $token, int $customerId, array $kv): void
     {
-        $requiredSlugs = [
-            'donor-id',
-            'donor-since',
-            'gc-donor-profile',
-            'location',
-            'payment-method',
-            'recurring-details',
-            'helpful-for-sponsorship-tickets',
+        $slugMap = [
+            'donor_identity' => ['slug' => 'donor-id',   'type' => 'text'], 
+            'donor_id'       => ['slug' => 'donor-id',   'type' => 'text'],
+            'donor_since'    => ['slug' => 'donor-since', 'type' => 'date'],
+            'gc_profile'     => ['slug' => 'gc-donor-profile', 'type' => 'url'],
+            'location'       => ['slug' => 'location',   'type' => 'text'],
+            'pay_method'     => ['slug' => 'payment-method', 'type' => 'text'],
+            'recur'          => ['slug' => 'recurring-details', 'type' => 'text'],
+            'sponsor_help'   => ['slug' => 'helpful-for-sponsorship-tickets', 'type' => 'text'],
         ];
-        $r = Http::withToken($token)->timeout(8)->get("{$this->hsApi}/customer-properties");
-        if (!$r->ok()) throw new SyncAbort('HS properties list failed: ' . $r->status() . ' ' . $r->body());
 
-        $existing = collect(data_get($r->json(), '_embedded.customer-properties', []))
-            ->pluck('slug')->filter()->values()->all();
-
-        $missing = array_values(array_diff($requiredSlugs, $existing));
-        if ($missing) {
-            throw new SyncAbort('Missing required Help Scout custom properties: ' . implode(', ', $missing));
-        }
         $ops = [];
-        foreach ($requiredSlugs as $slug) {
-            $val = $kv[$slug] ?? null;
-            if (in_array($slug, ['donor-since'], true) && $val) {
-                $val = $this->dateOnly((string)$val);
+        foreach ($kv as $concept => $rawVal) {
+            if (!array_key_exists($concept, $slugMap)) {
+                continue;
             }
+            $slug = $slugMap[$concept]['slug'];
+            $type = $slugMap[$concept]['type'];
+
+            $val = $this->coerceHsValue($type, $rawVal);
+            if ($val === null) {
+                Log::info('HS props: skipping invalid value', ['slug' => $slug, 'type' => $type, 'raw' => $rawVal]);
+                continue;
+            }
+
             $ops[] = ['op' => 'replace', 'path' => '/' . $slug, 'value' => $val];
         }
 
-        $r2 = Http::withToken($token)->acceptJson()->asJson()->timeout(10)
-            ->patch("{$this->hsApi}/customers/{$customerId}/properties", $ops);
-
-        if (!in_array($r2->status(), [200, 204], true)) {
-            throw new SyncAbort('HS client properties failed: ' . $r2->status() . ' ' . substr($r2->body(), 0, 250));
+        if (!$ops) {
+            Log::info('HS client properties no-op (nothing valid to set)', ['customerId' => $customerId]);
+            return;
         }
 
-        Log::info('HS client props: PATCH OK (7 fields, no auto-create)', [
-            'customerId' => $customerId,
-            'ops'        => count($ops),
-        ]);
+        $r = \Illuminate\Support\Facades\Http::withToken($token)
+            ->acceptJson()->asJson()->timeout(10)
+            ->patch("{$this->hsApi}/customers/{$customerId}/properties", $ops);
+
+        if (!in_array($r->status(), [200, 204], true)) {
+            Log::error('HS client properties failed', [
+                'status' => $r->status(),
+                'body'   => substr($r->body(), 0, 500),
+                'ops'    => $ops,
+            ]);
+            throw new SyncAbort('HS client properties failed: ' . $r->status() . ' ' . substr($r->body(), 0, 500));
+        }
+
+        Log::info('HS client props: PATCH OK', ['status' => $r->status(), 'ops' => count($ops)]);
     }
+    private function coerceHsValue(string $type, $raw)
+    {
+        if (is_array($raw) || is_object($raw)) return null;
+
+        switch ($type) {
+            case 'date':
+                if ($raw === null || $raw === '') return null;
+                try {
+                    return \Carbon\Carbon::parse((string)$raw)->toDateString();
+                } catch (\Throwable $e) {
+                    $s = substr((string)$raw, 0, 10);
+                    return preg_match('/^\d{4}-\d{2}-\d{2}$/', $s) ? $s : null;
+                }
+
+            case 'url':
+                $s = trim((string)$raw);
+                if ($s === '') return null;
+                if (!preg_match('~^https?://~i', $s)) {
+                    return null;
+                }
+                return mb_substr($s, 0, 2000);
+
+            case 'text':
+            default:
+                if ($raw === null) return null;
+                $s = trim((string)$raw);
+                if ($s === '') return null;       
+                return mb_substr($s, 0, 500);     
+        }
+    }
+
+
     private function firstNonEmpty(array $paths, array $source): mixed
     {
         foreach ($paths as $p) {
