@@ -79,46 +79,47 @@ class HelpScoutSync
         return $b;
     }
     private function buildClientProperties(array $b): array
-    {
-        $donorId = $this->firstNonEmpty([
-            'account.id',
-            'vendor_contact_id',
-        ], $b);
-        $donorId = is_string($donorId) || is_numeric($donorId) ? (string)$donorId : null;
+{
 
-        $donorSince = $this->resolveDonorSince($b);
+    $donorId = $this->firstNonEmpty(['account.id', 'vendor_contact_id'], $b);
+    $donorId = is_string($donorId) || is_numeric($donorId) ? (string)$donorId : null;
+    $donorSince = $this->resolveDonorSince($b);
 
-        $gcProfile = $this->firstNonEmpty([
-            'supporter.profile_url',
-            'line_items.0.public_url',
-        ], $b);
+    $gcProfile = $this->firstNonEmpty(['account.profile_url'], $b);
+    $country = $this->firstNonEmpty([
+        'billing_address.country_code',
+        'supporter.billing_address.country',
+        'billing_address.country',
+    ], $b);
+    $state = $this->firstNonEmpty([
+        'billing_address.province_code',
+        'supporter.billing_address.state',
+        'billing_address.state',
+    ], $b);
+    $loc = $this->joinPretty([$country, $state], ' / ');
 
-        $country = $this->firstNonEmpty([
-            'billing_address.country_code',
-            'supporter.billing_address.country',
-            'billing_address.country',
-        ], $b);
-        $state = $this->firstNonEmpty([
-            'billing_address.province_code',
-            'supporter.billing_address.state',
-            'billing_address.state',
-        ], $b);
-        $loc = $this->joinPretty([$country, $state], ' / ');
-        $paymentMethod = $this->formatPaymentMethod($b);
-        $recurringDetails = $this->buildRecurringDetails($b);
-        $s = $this->buildSponsorship($b);
-        $sponsorHelp = $this->joinPretty([$s['name'] ?? null, $s['ref'] ?? null], ', ');
+    // Payment Method
+    $paymentMethod = $this->formatPaymentMethod($b);
 
-        return [
-            'donor-id'                       => $donorId,
-            'donor-since'                    => $donorSince,
-            'gc-donor-profile'               => $gcProfile,
-            'location'                       => $loc,
-            'payment-method'                 => $paymentMethod,
-            'recurring-details'              => $recurringDetails,
-            'helpful-for-sponsorship-tickets' => $sponsorHelp,
-        ];
-    }
+    // Recurring Details: "$X / Monthly / 24th of Month"
+    $recurringDetails = $this->buildRecurringDetails($b);
+
+    // Sponsorship related (name, reference_number)
+    $s = $this->buildSponsorship($b);
+    $sponsorHelp = $this->joinPretty([$s['name'] ?? null, $s['ref'] ?? null], ', ');
+
+    // Return **concept keys** that hsPatchClientPropertiesStrict expects
+    return [
+        'donor_id'     => $donorId,
+        'donor_since'  => $donorSince,
+        'gc_profile'   => $gcProfile,
+        'location'     => $loc,
+        'pay_method'   => $paymentMethod,
+        'recur'        => $recurringDetails,
+        'sponsor_help' => $sponsorHelp,
+    ];
+}
+
 
     private function buildRecurringDetails(array $b): ?string
     {
@@ -400,6 +401,7 @@ class HelpScoutSync
             Log::warning('HS core update failed', ['status' => $r->status(), 'body' => substr($r->body(), 300)]);
         }
     }
+    
     private function resolveDonorSince(array $b): ?string
     {
         $candidates = [
@@ -495,7 +497,7 @@ class HelpScoutSync
             return;
         }
 
-        $r = \Illuminate\Support\Facades\Http::withToken($token)
+        $r = Http::withToken($token)
             ->acceptJson()->asJson()->timeout(10)
             ->patch("{$this->hsApi}/customers/{$customerId}/properties", $ops);
 
