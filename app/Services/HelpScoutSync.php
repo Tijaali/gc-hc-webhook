@@ -15,27 +15,18 @@ class HelpScoutSync
     private string $hsTokenUrl = 'https://api.helpscout.net/v2/oauth2/token';
     private string $hsApi      = 'https://api.helpscout.net/v2';
 
-    /**
-     * Entry point called by WebhookController.
-     * Only writes the 7 merged properties your client asked for.
-     */
     public function runStrict(string $event, string $delivery, string $domain, array $body): void
     {
         $b = $this->normalize($event, $body);
 
-        // Resolve donor email (we still need it to look up/create contact)
         $email = $this->firstNonEmpty([
-            'account.email',
-            'supporter.email',
-            'billing_address.email',
-            'customer.email',
-            'email',
+            'account.email','supporter.email','billing_address.email','customer.email','email',
         ], $b);
         if (!$email) throw new SyncAbort('No donor email in payload');
 
         $token = $this->hsAccessTokenStrict();
 
-        // Find or create the HS customer
+        // find/create HS customer
         $cust = $this->hsFindCustomerWithRetry($token, $email);
         $id   = $cust['id'] ?? 0;
         if (!$id) {
@@ -45,21 +36,18 @@ class HelpScoutSync
         }
         if (!$id) throw new SyncAbort('Could not resolve or create HS customer');
 
-        // Build merged properties as single strings
-        $props = $this->buildMergedProperties($b);
+        // build EXACT properties requested
+        $props = $this->buildClientProperties($b);
 
-        // Upsert those 7 properties only
-        $this->hsPatchMergedPropertiesStrict($token, $id, $props);
+        // upsert only those 9 properties (auto-create if missing)
+        $this->hsPatchClientPropertiesStrict($token, $id, $props);
 
         Log::info('HS_SYNC_OK_MIN', compact('event','delivery','email') + ['customerId'=>$id]);
     }
 
-    /* ───────────────────────────────────────────────────────────
-     * Normalization across GC payload shapes
-     * ─────────────────────────────────────────────────────────── */
+    /* ------------ normalization (kept lean) ------------ */
     private function normalize(string $event, array $b): array
     {
-        // If supporters[] present, surface as supporter and bridged bits
         if (isset($b['supporters'][0])) {
             $b['supporter'] = $b['supporters'][0];
             $b['email'] = $b['supporter']['email']
@@ -72,95 +60,93 @@ class HelpScoutSync
             }
         }
 
-        // Bridge recurring profile into a line_items[0] shape if present
+        // bridge recurring_profile into line_items[0]
         if (isset($b['recurring_profile']) && is_array($b['recurring_profile'])) {
             $rp = $b['recurring_profile'];
-            if (!isset($b['line_items'][0])) $b['line_items'][0] = [];
             $b['line_items'][0]['recurring_profile'] = $rp;
             $b['line_items'][0]['recurring_amount']  = $rp['amount'] ?? ($b['line_items'][0]['recurring_amount'] ?? null);
             $b['line_items'][0]['recurring_day']     = $this->extractDayNumber($rp['billing_period_day'] ?? null);
 
-            // Fill currency if missing
             if (!isset($b['currency'])) {
                 $b['currency'] = data_get($rp, 'currency.code') ?: data_get($rp, 'currency.iso_code');
             }
 
-            // Payment brand hint
             $acctType = data_get($rp, 'payment_method.account_type') ?: data_get($rp, 'payment_method.display_name');
             if ($acctType) {
-                $b['payments'][0]['type']           = 'card';
-                $b['payments'][0]['status']         = ($rp['status'] ?? '') === 'Active' ? 'succeeded' : (data_get($b,'payments.0.status') ?? null);
-                $b['payments'][0]['card']['brand']  = $acctType;
+                $b['payments'][0]['type']          = 'card';
+                $b['payments'][0]['status']        = ($rp['status'] ?? '') === 'Active' ? 'succeeded' : (data_get($b,'payments.0.status') ?? null);
+                $b['payments'][0]['card']['brand'] = $acctType;
             }
         }
 
         return $b;
     }
 
-    /* ───────────────────────────────────────────────────────────
-     * Build ONLY the merged fields client requested
-     * ─────────────────────────────────────────────────────────── */
-    private function buildMergedProperties(array $b): array
+    /* ------------ build exact fields ------------ */
+    private function buildClientProperties(array $b): array
     {
-        // Donor Identity: First + Last (prefer account.*, fallback to supporter/billing)
+        // Name (donor-identity): First + Last (prefer account.*)
         $first = $this->firstNonEmpty(['account.first_name','supporter.first_name','billing_address.first_name'], $b);
         $last  = $this->firstNonEmpty(['account.last_name','supporter.last_name','billing_address.last_name'], $b);
         $donorIdentity = trim(implode(' ', array_filter([$first, $last])));
 
-        // Donor ID (single value): email > account.id > vendor_contact_id
+        // Donor ID (donor-id): account.email -> account.id -> vendor_contact_id
         $donorId = $this->firstNonEmpty(['account.email','account.id','vendor_contact_id'], $b);
-        if (is_array($donorId) || is_object($donorId)) $donorId = null; // safety
+        if (is_array($donorId) || is_object($donorId)) $donorId = null;
 
-        // Last Donation Info: "<amount> <currency> — <date>"
+        // Last Donation Amount (last-donation-amount): "<amount> <currency>"
         $amount   = $this->firstNonEmpty(['total_amount','subtotal_amount','amount','line_items.0.recurring_amount'], $b);
         $currency = $this->firstNonEmpty(['currency','payments.0.currency.code','line_items.0.recurring_profile.currency.code'], $b);
+        $lastDonationAmount = ($amount !== null && $currency)
+            ? sprintf('%s %s', $this->money((float)$amount), $currency)
+            : null;
+
+        // Last Donation Date (last-donation-date): created_at (fallback ordered_at)
         $dateRaw  = $this->firstNonEmpty(['created_at','ordered_at'], $b);
-        $date     = $this->dateOnly($dateRaw);
-        $amtStr   = ($amount !== null && $currency) ? sprintf('%s %s', $this->money((float)$amount), $currency) : null;
-        $lastDonationInfo = $this->joinPretty([$amtStr, $date], ' — ');
+        $lastDonationDate = $this->dateOnly($dateRaw);
 
-        // Recurring Details: "$X / Monthly / 1st of Month"
-        $recurring = $this->buildRecurringDetails($b);
+        // Recurring Details (recurring-details): "$X / Monthly / 1st of Month"
+        $recurringDetails = $this->buildRecurringDetails($b);
 
-        // Sponsorship Info: "Full Name, REF, URL"
+        // Helpful for sponsorship tickets (helpful-for-sponsorship-tickets): "Full Name, REF, URL"
         $s = $this->buildSponsorship($b);
-        $sponsorshipInfo = $this->joinPretty([$s['name'] ?? null, $s['ref'] ?? null, $s['url'] ?? null], ', ');
+        $sponsorshipMerged = $this->joinPretty([$s['name'] ?? null, $s['ref'] ?? null, $s['url'] ?? null], ', ');
 
-        // Location: "Country / Province"
+        // Country / Province separate (slugs: country, state)
         $country = $this->firstNonEmpty(['billing_address.country','billing_address.country_code','supporter.billing_address.country'], $b);
-        $state   = $this->firstNonEmpty(['billing_address.state','billing_address.province_code','supporter.billing_address.state'], $b);
-        $location = $this->joinPretty([$country, $state], ' / ');
+        $province = $this->firstNonEmpty(['billing_address.state','billing_address.province_code','supporter.billing_address.state'], $b);
 
-        // Payment Type (brand): payments[0].card.brand OR transactions[0].cc_type
-        $payType = $this->firstNonEmpty(['payments.0.card.brand','transactions.0.cc_type','payment_type','line_items.0.recurring_profile.payment_method.account_type'], $b);
+        // Payment Method (payment-method)
+        $paymentMethod = $this->firstNonEmpty([
+            'payments.0.card.brand','transactions.0.cc_type','payment_type','line_items.0.recurring_profile.payment_method.account_type'
+        ], $b);
 
         return array_filter([
-            'donor_identity'   => $donorIdentity ?: null,
-            'donor_id'         => $donorId ?: null,
-            'last_donation'    => $lastDonationInfo ?: null,
-            'recurring_details'=> $recurring ?: null,
-            'sponsorship_info' => $sponsorshipInfo ?: null,
-            'location'         => $location ?: null,
-            'payment_type'     => $payType ?: null,
+            // concept keys map to slugs below
+            'donor_identity' => $donorIdentity ?: null,
+            'donor_id'       => $donorId ?: null,
+            'last_amt'       => $lastDonationAmount ?: null,
+            'last_date'      => $lastDonationDate ?: null,
+            'recur'          => $recurringDetails ?: null,
+            'sponsor_help'   => $sponsorshipMerged ?: null,
+            'country'        => $country ?: null,
+            'state'          => $province ?: null,
+            'pay_method'     => $paymentMethod ?: null,
         ], fn($v) => $v !== null && $v !== '');
     }
 
     private function buildRecurringDetails(array $b): ?string
     {
-        // Prefer embedded line_items[0] view (covers most GC payloads)
         $li0 = data_get($b, 'line_items.0');
         if ($li0) {
             $amt    = data_get($li0, 'recurring_amount') ?? data_get($li0, 'price');
             $period = data_get($li0, 'recurring_profile.billing_period_description') ?? data_get($li0, 'variant.billing_period');
             $day    = data_get($li0, 'recurring_day') ?? data_get($li0, 'recurring_profile.billing_period_day');
             if ($day && !is_numeric($day)) $day = $this->extractDayNumber((string)$day);
-
             if ($amt !== null && $period && $day) {
                 return sprintf('$%s / %s / %s of Month', $this->money((float)$amt), $this->humanPeriod($period), $this->ordinal((int)$day));
             }
         }
-
-        // Fallback to top-level recurring_profile (if any)
         $rp = data_get($b, 'recurring_profile');
         if ($rp) {
             $amt    = data_get($rp, 'amount');
@@ -170,7 +156,6 @@ class HelpScoutSync
                 return sprintf('$%s / %s / %s of Month', $this->money((float)$amt), $this->humanPeriod($period), $this->ordinal((int)$day));
             }
         }
-
         return null;
     }
 
@@ -178,16 +163,13 @@ class HelpScoutSync
     {
         $li = data_get($b, 'line_items.0');
         return [
-            'name' => data_get($li, 'sponsee.full_name') ?: null,
-            'ref'  => data_get($li, 'reference') ?: data_get($li, 'reference_number') ?: null,
-            'url'  => data_get($li, 'public_url') ?: null,
+            'name' => data_get($li, 'sponsorship.full_name') ?: data_get($li, 'sponsee.full_name') ?: null,
+            'ref'  => data_get($li, 'sponsorship.reference_number') ?: data_get($li, 'reference') ?: null,
+            'url'  => data_get($li, 'sponsorship.url') ?: data_get($li, 'public_url') ?: null,
         ];
     }
 
-    /* ───────────────────────────────────────────────────────────
-     * Help Scout API bits (token, customer lookup/create, props)
-     * ─────────────────────────────────────────────────────────── */
-
+    /* ------------ HS API (token, customer, props) ------------ */
     private function hsAccessTokenStrict(): string
     {
         if ($cached = Cache::get('hs_access_token')) {
@@ -205,17 +187,17 @@ class HelpScoutSync
                 return (string)$cached;
             }
 
-            // Read refresh token (file → cache fallback)
             $refresh = '';
             $src = 'none';
+
             $path = 'hs_oauth.json';
             if (Storage::exists($path)) {
                 $j = json_decode(Storage::get($path), true) ?: [];
-                if (!empty($j['refresh_token'])) { $refresh = (string)$j['refresh_token']; $src = 'file'; }
+                if (!empty($j['refresh_token'])) { $refresh = (string)$j['refresh_token']; $src='file'; }
             }
             if ($refresh === '') {
                 $rt = Cache::get('hs_refresh_file');
-                if ($rt) { $refresh = (string)$rt; $src = 'cache'; }
+                if ($rt) { $refresh = (string)$rt; $src='cache'; }
             }
             if ($refresh === '') throw new SyncAbort('Missing HS refresh token (visit /oauth/hs/start)');
 
@@ -258,22 +240,18 @@ class HelpScoutSync
 
     private function hsFindCustomer(string $token, string $email): ?array
     {
-        // 1) direct email query
         $r1 = Http::withToken($token)->timeout(8)->get("{$this->hsApi}/customers", ['email'=>$email,'page'=>1]);
         if ($r1->ok()) {
             $hit = data_get($r1->json(), '_embedded.customers.0');
             if ($hit) return $hit;
         }
-
-        // 2) DSL (their search supports query= for customers)
         $q  = '(email:"' . addslashes($email) . '")';
-        $r2 = Http::withToken($token)->timeout(8)->get("{$this->hsApi}/customers", ['query'=>$q, 'page'=>1]);
+        $r2 = Http::withToken($token)->timeout(8)->get("{$this->hsApi}/customers", ['query'=>$q,'page'=>1]);
         if ($r2->ok()) {
             $hit = data_get($r2->json(), '_embedded.customers.0');
             if ($hit) return $hit;
         }
-
-        Log::warning('HS find failed', ['email'=>$email, 's1'=>$r1->status(), 's2'=>$r2->status(), 'b2'=>$r2->body()]);
+        Log::warning('HS find failed', ['email'=>$email,'s1'=>$r1->status(),'s2'=>$r2->status(),'b2'=>$r2->body()]);
         return null;
     }
 
@@ -314,7 +292,7 @@ class HelpScoutSync
             throw new SyncAbort('HS create returned 201 but no id header');
         }
 
-        if ($r->status() === 409) { // exists
+        if ($r->status() === 409) {
             $existing = $this->hsFindCustomerWithRetry($token, $email);
             if ($existing && isset($existing['id'])) {
                 Log::info('HS create: 409 conflict → using existing id (after retry)', ['id'=>(int)$existing['id']]);
@@ -323,53 +301,59 @@ class HelpScoutSync
             throw new SyncAbort('HS create conflict but could not fetch existing');
         }
 
-        Log::warning('HS create failed', ['status'=>$r->status(), 'body'=>substr($r->body(), 300)]);
+        Log::warning('HS create failed', ['status'=>$r->status(),'body'=>substr($r->body(), 300)]);
         throw new SyncAbort('HS create failed: '.$r->status().' '.$r->body());
     }
 
-    /**
-     * Ensure the 7 merged slugs exist, then patch them.
-     */
-    private function hsPatchMergedPropertiesStrict(string $token, int $customerId, array $kv): void
+    private function hsPatchClientPropertiesStrict(string $token, int $customerId, array $kv): void
     {
-        $needSlugs = [
-            'donor-identity','donor-id','last-donation-info',
-            'recurring-details','sponsorship-info','location','payment-type',
+        // the 9 properties we care about (slug => display name)
+        $need = [
+            'donor-identity'                 => 'Name',
+            'donor-id'                       => 'Donor ID',
+            'last-donation-amount'           => 'Last Donation Amount',
+            'last-donation-date'             => 'Last Donation Date',
+            'recurring-details'              => 'Recurring Details',
+            'helpful-for-sponsorship-tickets'=> 'Helpful for sponsorship tickets',
+            'country'                        => 'Country',
+            'state'                          => 'Province',
+            'payment-method'                 => 'Payment Method',
         ];
 
-        // Fetch existing slugs
+        // fetch existing slugs
         $r = Http::withToken($token)->timeout(8)->get("{$this->hsApi}/customer-properties");
         if (!$r->ok()) throw new SyncAbort('HS properties list failed: '.$r->status().' '.$r->body());
 
         $existing = collect(data_get($r->json(), '_embedded.customer-properties', []))
             ->pluck('slug')->all();
 
-        // Create missing as text
-        $missing = array_values(array_diff($needSlugs, $existing));
-        foreach ($missing as $slug) {
-            $name = ucwords(str_replace(['-', '_'], ' ', $slug));
+        // create missing (text, except we keep text for all here)
+        foreach ($need as $slug => $display) {
+            if (in_array($slug, $existing, true)) continue;
             $resp = Http::withToken($token)->acceptJson()->asJson()->timeout(10)
                 ->post("{$this->hsApi}/customer-properties", [
                     'type' => 'text',
                     'slug' => $slug,
-                    'name' => $name,
+                    'name' => $display,
                 ]);
             if ($resp->created()) {
-                Log::info('HS property created', ['slug'=>$slug,'type'=>'text']);
+                Log::info('HS property created', ['slug'=>$slug,'name'=>$display]);
             } else {
                 Log::warning('HS property create failed', ['slug'=>$slug,'status'=>$resp->status(),'body'=>substr($resp->body(),200)]);
             }
         }
 
-        // Map our 7 concepts to slugs
+        // concept -> slug mapping
         $slugMap = [
-            'donor_identity'    => 'donor-identity',
-            'donor_id'          => 'donor-id',
-            'last_donation'     => 'last-donation-info',
-            'recurring_details' => 'recurring-details',
-            'sponsorship_info'  => 'sponsorship-info',
-            'location'          => 'location',
-            'payment_type'      => 'payment-type',
+            'donor_identity' => 'donor-identity',
+            'donor_id'       => 'donor-id',
+            'last_amt'       => 'last-donation-amount',
+            'last_date'      => 'last-donation-date',
+            'recur'          => 'recurring-details',
+            'sponsor_help'   => 'helpful-for-sponsorship-tickets',
+            'country'        => 'country',
+            'state'          => 'state',
+            'pay_method'     => 'payment-method',
         ];
 
         $ops = [];
@@ -377,25 +361,22 @@ class HelpScoutSync
             if ($val === null || $val === '') continue;
             $slug = $slugMap[$concept] ?? null;
             if (!$slug) continue;
-            $ops[] = ['op'=>'replace', 'path'=>'/'.$slug, 'value'=>$val];
+            $ops[] = ['op'=>'replace','path'=>'/'.$slug,'value'=>$val];
         }
 
-        if (!$ops) { Log::info('HS merged properties no-op', ['customerId'=>$customerId]); return; }
+        if (!$ops) { Log::info('HS client properties no-op', ['customerId'=>$customerId]); return; }
 
-        // PATCH (array of operations)
         $r2 = Http::withToken($token)->acceptJson()->asJson()->timeout(10)
             ->patch("{$this->hsApi}/customers/{$customerId}/properties", $ops);
 
         if (!in_array($r2->status(), [200,204], true)) {
-            throw new SyncAbort('HS merged properties failed: '.$r2->status().' '.substr($r2->body(),250));
+            throw new SyncAbort('HS client properties failed: '.$r2->status().' '.substr($r2->body(),250));
         }
 
-        Log::info('HS merged props: PATCH OK', ['status'=>$r2->status(),'ops'=>count($ops)]);
+        Log::info('HS client props: PATCH OK', ['status'=>$r2->status(),'ops'=>count($ops)]);
     }
 
-    /* ───────────────────────────────────────────────────────────
-     * Utils
-     * ─────────────────────────────────────────────────────────── */
+    /* ------------ utils ------------ */
     private function firstNonEmpty(array $paths, array $source): mixed
     {
         foreach ($paths as $p) {
@@ -405,19 +386,19 @@ class HelpScoutSync
         return null;
     }
 
-    private function dateOnly(?string $raw): ?string
-    {
-        if ($raw === null || $raw === '') return null;
-        try { return Carbon::parse($raw)->toDateString(); }
-        catch (\Throwable $e) { return substr((string)$raw, 0, 10); }
-    }
-
     private function extractDayNumber($raw): ?int
     {
         if ($raw === null || $raw === '') return null;
         if (is_numeric($raw)) return (int)$raw;
         if (is_string($raw) && preg_match('/(\d{1,2})/', $raw, $m)) return (int)$m[1];
         return null;
+    }
+
+    private function dateOnly(?string $raw): ?string
+    {
+        if ($raw === null || $raw === '') return null;
+        try { return Carbon::parse($raw)->toDateString(); }
+        catch (\Throwable $e) { return substr((string)$raw, 0, 10); }
     }
 
     private function money(float $n): string
@@ -436,10 +417,10 @@ class HelpScoutSync
     {
         $raw = strtolower(trim($raw));
         return match ($raw) {
-            'month', 'monthly'   => 'Monthly',
-            'year', 'yearly', 'annually' => 'Yearly',
-            'week', 'weekly'     => 'Weekly',
-            default               => ucfirst($raw),
+            'month','monthly'                 => 'Monthly',
+            'year','yearly','annually'        => 'Yearly',
+            'week','weekly'                   => 'Weekly',
+            default                           => ucfirst($raw),
         };
     }
 
