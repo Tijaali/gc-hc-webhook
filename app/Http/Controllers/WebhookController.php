@@ -41,7 +41,7 @@ class WebhookController extends Controller
      * Givecloud Webhook
      * ========================= */
 
-   public function gc(Request $r)
+    public function gc(Request $r)
     {
         // 1) Verify signature (hard fail if missing/wrong)
         $this->verifyGivecloud($r);
@@ -65,7 +65,6 @@ class WebhookController extends Controller
 
             // 4) Only after work is done, reply 200
             return response()->json(['status' => 'ok'], 200);
-
         } catch (\Throwable $e) {
             Log::error('GC webhook fatal', [
                 'event'    => $event,
