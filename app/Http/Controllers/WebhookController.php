@@ -2,21 +2,13 @@
 
 namespace App\Http\Controllers;
 
-use App\Jobs\ProcessGivecloudEvent;
-use App\Jobs\SyncHelpScoutFromGivecloud;
-use App\Services\HelpScout;
 use App\Services\HelpScoutSync;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\Log;
-use Illuminate\Support\Facades\Response;
 
 class WebhookController extends Controller
 {
-    /* =========================
-     * OAuth (Help Scout)
-     * ========================= */
-
     public function hsStart()
     {
         $clientId    = env('HS_CLIENT_ID');
@@ -30,27 +22,19 @@ class WebhookController extends Controller
         return redirect($authUrl);
     }
 
-    public function hsCallback(Request $r, HelpScout $hs)
+    public function hsCallback(Request $r, \App\Services\HelpScout $hs)
     {
         abort_unless($r->has('code'), 400, 'Missing code');
         $data = $hs->exchangeCode((string)$r->query('code'));
         return response()->json($data);
     }
 
-    /* =========================
-     * Givecloud Webhook
-     * ========================= */
-
     public function gc(Request $r)
     {
-        // 1) Verify signature (hard fail if missing/wrong)
         $this->verifyGivecloud($r);
 
-        // 2) Idempotency (avoid double-processing the same delivery)
         $deliveryId = (string)($r->header('X-Givecloud-Delivery') ?? '');
-        if ($deliveryId === '') {
-            $deliveryId = sha1($r->getContent());
-        }
+        if ($deliveryId === '') $deliveryId = sha1($r->getContent());
         if (!Cache::add("gc:seen:$deliveryId", 1, now()->addMinutes(15))) {
             return response()->json(['status' => 'duplicate'], 200);
         }
@@ -60,10 +44,7 @@ class WebhookController extends Controller
         $payload = $r->json()->all();
 
         try {
-            // 3) Do the full HS sync NOW (synchronous & reliable)
-            (new HelpScoutSync())->run($event, $deliveryId, $domain, $payload);
-
-            // 4) Only after work is done, reply 200
+            (new HelpScoutSync())->runStrict($event, $deliveryId, $domain, $payload);
             return response()->json(['status' => 'ok'], 200);
         } catch (\Throwable $e) {
             Log::error('GC webhook fatal', [
@@ -73,9 +54,7 @@ class WebhookController extends Controller
                 'line'     => $e->getLine(),
                 'file'     => $e->getFile(),
             ]);
-
-            // 5xx tells Givecloud to retry. Keep payload safe with idempotency key above.
-            return response()->json(['status' => 'error', 'msg' => 'internal'], 500);
+            return response()->json(['status' => 'error'], 500);
         }
     }
 
