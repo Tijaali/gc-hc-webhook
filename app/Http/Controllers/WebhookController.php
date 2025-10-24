@@ -2,6 +2,7 @@
 
 namespace App\Http\Controllers;
 
+use App\Jobs\ProcessGivecloudEvent;
 use App\Jobs\SyncHelpScoutFromGivecloud;
 use App\Services\HelpScout;
 use Illuminate\Http\Request;
@@ -41,53 +42,45 @@ class WebhookController extends Controller
 
     public function gc(Request $r)
     {
-        // 1) Verify signature (constant-time compare)
         $this->verifyGivecloud($r);
 
-        // 2) Idempotency key from delivery header
-        $deliveryId = (string)($r->header('X-Givecloud-Delivery') ?? '');
-        if ($deliveryId !== '') {
-            $cacheKey = 'gc:delivery:' . $deliveryId;
-            if (!Cache::add($cacheKey, 1, now()->addMinutes(10))) {
-                // already processed
-                return Response::json(['status' => 'duplicate'], 200);
-            }
+        // Idempotency
+        $delivery = (string) ($r->header('X-Givecloud-Delivery') ?? '');
+        if ($delivery === '') {
+            $delivery = sha1($r->getContent());
+        }
+        if (!Cache::add("gc:seen:$delivery", 1, now()->addMinutes(10))) {
+            return response()->noContent(202);
         }
 
-        // 3) Read raw payload (don’t log big bodies)
-        $event   = (string)($r->header('X-Givecloud-Event') ?? 'unknown');
+        $event   = (string) ($r->header('X-Givecloud-Event') ?? 'unknown');
+        $domain  = (string) ($r->header('X-Givecloud-Domain') ?? '');
         $payload = $r->json()->all();
 
-        // 4) Ack fast — run async by default
-        $async = filter_var(env('GC_ASYNC', true), FILTER_VALIDATE_BOOLEAN);
-        if ($async) {
-            SyncHelpScoutFromGivecloud::dispatch($payload, $event, $deliveryId);
-            return Response::json(['accepted' => true], 202);
+        // Queue (if worker available)
+        ProcessGivecloudEvent::dispatch($event, $delivery, $domain, $payload)->onQueue('hs');
+
+        // After-response fallback:
+        if (method_exists(ProcessGivecloudEvent::class, 'dispatchAfterResponse')) {
+            ProcessGivecloudEvent::dispatchAfterResponse($event, $delivery, $domain, $payload);
+        } else {
+            // Laravel < 8.57 fallback
+            app()->terminating(function () use ($event, $delivery, $domain, $payload) {
+                dispatch((new ProcessGivecloudEvent($event, $delivery, $domain, $payload))->onQueue('hs'));
+            });
         }
 
-        // Fallback: sync (useful for debugging)
-        dispatch_sync(new SyncHelpScoutFromGivecloud($payload, $event, $deliveryId));
-        return Response::json(['ok' => true], 200);
+        return response()->noContent(202);
     }
-
-    /* =========================
-     * Helpers
-     * ========================= */
 
     private function verifyGivecloud(Request $r): void
     {
         $secret = (string) env('GC_WEBHOOK_SECRET', '');
         abort_unless($secret !== '', 500, 'Missing GC_WEBHOOK_SECRET');
 
-        $sig = $r->header('X-Givecloud-Signature') ?? $r->header('x-givecloud-signature');
-        $raw = $r->getContent();
+        $sig  = $r->header('X-Givecloud-Signature') ?? $r->header('x-givecloud-signature');
+        $raw  = $r->getContent();
         $calc = hash_hmac('sha1', $raw, $secret);
-
-        if (env('GC_LOG_SIG', false)) {
-            Log::debug('GC sig', [
-                'match' => $sig && hash_equals((string)$sig, (string)$calc),
-            ]);
-        }
 
         abort_unless($sig && hash_equals((string)$sig, (string)$calc), 401, 'Invalid signature');
     }

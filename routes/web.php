@@ -18,6 +18,3 @@ Route::get('/oauth/hs/start', [WebhookController::class, 'hsStart']);
 Route::get('/oauth/hs/callback', [WebhookController::class, 'hsCallback']);
 
 Route::post('/webhooks/givecloud', [WebhookController::class, 'gc'])->withoutMiddleware([FrameworkCsrf::class]);
-
-Route::get('/debug/hs/properties', [WebhookController::class, 'debugHsProperties']);
-Route::get('/debug/hs/customer', [WebhookController::class, 'debugHsCustomer']);
