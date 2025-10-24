@@ -2,6 +2,7 @@
 
 namespace App\Http\Controllers;
 
+use App\Jobs\ProcessGivecloudEvent;
 use App\Services\HelpScoutSync;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\Cache;
@@ -28,35 +29,55 @@ class WebhookController extends Controller
         $data = $hs->exchangeCode((string)$r->query('code'));
         return response()->json($data);
     }
-
     public function gc(Request $r)
     {
         $this->verifyGivecloud($r);
 
         $deliveryId = (string)($r->header('X-Givecloud-Delivery') ?? '');
         if ($deliveryId === '') $deliveryId = sha1($r->getContent());
+
         if (!Cache::add("gc:seen:$deliveryId", 1, now()->addMinutes(15))) {
             return response()->json(['status' => 'duplicate'], 200);
         }
 
-        $event   = (string)($r->header('X-Givecloud-Event') ?? 'unknown');
-        $domain  = (string)($r->header('X-Givecloud-Domain') ?? '');
-        $payload = $r->json()->all();
+        // enqueue the heavy work and ACK quickly
+       ProcessGivecloudEvent::dispatch([
+            'event'   => (string)($r->header('X-Givecloud-Event') ?? 'unknown'),
+            'domain'  => (string)($r->header('X-Givecloud-Domain') ?? ''),
+            'payload' => $r->json()->all(),
+            'delivery' => $deliveryId,
+        ])->onQueue('webhooks');
 
-        try {
-            (new HelpScoutSync())->runStrict($event, $deliveryId, $domain, $payload);
-            return response()->json(['status' => 'ok'], 200);
-        } catch (\Throwable $e) {
-            Log::error('GC webhook fatal', [
-                'event'    => $event,
-                'delivery' => $deliveryId,
-                'err'      => $e->getMessage(),
-                'line'     => $e->getLine(),
-                'file'     => $e->getFile(),
-            ]);
-            return response()->json(['status' => 'error'], 500);
-        }
+        return response()->json(['status' => 'accepted'], 200);
     }
+    // public function gc(Request $r)
+    // {
+    //     $this->verifyGivecloud($r);
+
+    //     $deliveryId = (string)($r->header('X-Givecloud-Delivery') ?? '');
+    //     if ($deliveryId === '') $deliveryId = sha1($r->getContent());
+    //     if (!Cache::add("gc:seen:$deliveryId", 1, now()->addMinutes(15))) {
+    //         return response()->json(['status' => 'duplicate'], 200);
+    //     }
+
+    //     $event   = (string)($r->header('X-Givecloud-Event') ?? 'unknown');
+    //     $domain  = (string)($r->header('X-Givecloud-Domain') ?? '');
+    //     $payload = $r->json()->all();
+
+    //     try {
+    //         (new HelpScoutSync())->runStrict($event, $deliveryId, $domain, $payload);
+    //         return response()->json(['status' => 'ok'], 200);
+    //     } catch (\Throwable $e) {
+    //         Log::error('GC webhook fatal', [
+    //             'event'    => $event,
+    //             'delivery' => $deliveryId,
+    //             'err'      => $e->getMessage(),
+    //             'line'     => $e->getLine(),
+    //             'file'     => $e->getFile(),
+    //         ]);
+    //         return response()->json(['status' => 'error'], 500);
+    //     }
+    // }
 
     private function verifyGivecloud(Request $r): void
     {
