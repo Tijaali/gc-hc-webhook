@@ -115,7 +115,11 @@ class HelpScout
         Log::warning('HS search (email) failed', ['status' => $r->status()]);
 
         // Fallback DSL
-        $r2 = $http()->get("{$this->api}/customers", ['query' => '(email:"' . $email . '")', 'page' => 1]);
+        $r2 = $http()->get("{$this->api}/search/customers", [
+            'query' => '(email:"' . $email . '")',
+            'page'  => 1,
+        ]); // ✅ correct path for search DSL
+
         if ($r2->ok()) {
             return data_get($r2->json(), '_embedded.customers.0');
         }
@@ -184,13 +188,8 @@ class HelpScout
 
     public function patchProperties(string $token, int $customerId, array $kv): void
     {
-        $slugMap = $this->slugMap();
+        $slugMap  = $this->slugMap();
         $existing = $this->propertySlugs($token);
-
-        // Warn once for important slugs
-        $must = ['last-donation-amount', 'payment-method', 'billing-address1', 'billing-city', 'billing-postal', 'recurring-summary', 'sponsorship-name', 'sponsorship-ref', 'sponsorship-url'];
-        $missing = array_values(array_diff($must, $existing));
-        if ($missing) Log::warning('HS missing important custom properties (please create these slugs)', $missing);
 
         $numeric = ['donor-id', 'lifetime-donation', 'phone-no'];
         $ops = [];
@@ -202,7 +201,7 @@ class HelpScout
 
             if (in_array($slug, ['last-order', 'donor-since'], true)) {
                 try {
-                    $val = Carbon::parse($val)->toDateString();
+                    $val = \Carbon\Carbon::parse($val)->toDateString();
                 } catch (\Throwable $e) {
                     $val = substr((string)$val, 0, 10);
                 }
@@ -217,17 +216,21 @@ class HelpScout
 
         if (!$ops) return;
 
-        $r = Http::withToken($token)->connectTimeout(2)->timeout(8)
+        $payload = ['operations' => $ops]; // ✅ wrap in "operations"
+
+        $r = \Illuminate\Support\Facades\Http::withToken($token)
+            ->connectTimeout(2)->timeout(8)
             ->acceptJson()->asJson()
-            ->patch("{$this->api}/customers/{$customerId}/properties", $ops);
+            ->patch("{$this->api}/customers/{$customerId}/properties", $payload);
 
         if (!in_array($r->status(), [200, 204], true)) {
-            Log::warning('HS properties patch failed (non-fatal)', [
+            \Illuminate\Support\Facades\Log::warning('HS properties patch failed (non-fatal)', [
                 'status' => $r->status(),
                 'body'   => substr($r->body(), 0, 250),
             ]);
         }
     }
+
 
     private function slugMap(): array
     {
